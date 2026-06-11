@@ -59,7 +59,7 @@ for (const id of ids) {
     if (justificativa) H.push(`<p><b>Por que teste é necessário aqui:</b> ${esc(justificativa)}</p>`);
     if (sugestao) H.push(`<p><b>O que deve ser coberto:</b> ${esc(sugestao)}</p>`);
     H.push(`<p>Após incluir o(s) teste(s) no PR, sinalizar para nova validação de QA.</p>`);
-    H.push(`<p><i>Validação automática de QA — sittax-qa-review</i></p>`);
+    H.push(`<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>`);
     await ado(`${base}?api-version=7.1-preview.3`, { method: 'POST', body: { text: H.join('') } });
     console.log(`#${id}: comentario de reprovacao postado`);
   } catch (e) {

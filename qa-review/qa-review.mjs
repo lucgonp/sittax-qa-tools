@@ -312,7 +312,7 @@ async function autoReject(wi, prs) {
   H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
   H.push(`<p>O(s) PR(s) vinculado(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) não alteram nenhum arquivo de teste (<code>/src/Tests/</code>, <code>.spec.ts</code>, <code>*Test.cs</code>).</p>`);
   H.push('<p>Inclua teste automatizado cobrindo a mudança e devolva a atividade para Review — a validação de QA será refeita automaticamente.</p>');
-  H.push('<p><i>Validação automática de QA — sittax-qa-review</i></p>');
+  H.push('<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>');
   await postComment(wi.id, H.join(''));
   await moveToRejected(wi);
 }
