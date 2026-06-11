@@ -113,6 +113,8 @@ async function getWorkItem(id) {
 
 const CODE_EXT = /\.(cs|ts|html|scss|css|js|sql|py)$/i;
 const TEST_PATH = /\/src\/Tests\/|\.spec\.|Test\.cs$|\.test\./i;
+// mudancas SO nessa pasta (frontend) nao sao reprovadas por falta de teste — apenas aviso
+const SPA_PATH = /^\/Sittax\.Spa\//i;
 
 async function fileAtBranch(base, filePath, branch) {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=branch&api-version=7.1&$format=text`, { asText: true });
@@ -139,7 +141,7 @@ async function getPrContext(repoId, prId) {
   const iters = await ado(`${base}/pullRequests/${prId}/iterations?api-version=7.1`);
   const last = iters.value[iters.value.length - 1].id;
   const ch = await ado(`${base}/pullRequests/${prId}/iterations/${last}/changes?api-version=7.1&$top=300&$compareTo=0`);
-  const files = (ch.changeEntries || []).filter((c) => c.item && !c.item.isFolder)
+  const files = (ch.changeEntries || []).filter((c) => c.item && c.item.path && !c.item.isFolder)
     .map((c) => ({ changeType: c.changeType, path: c.item.path }));
   const testFiles = files.filter((f) => TEST_PATH.test(f.path));
   const codeFiles = files.filter((f) => CODE_EXT.test(f.path) && !TEST_PATH.test(f.path) && f.changeType !== 'delete');
@@ -254,9 +256,12 @@ RESPONDA APENAS com JSON valido:
 // ---------- render ----------
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-function renderHtml(wi, prs, rep) {
+function renderHtml(wi, prs, rep, avisoSpaSemTeste = false) {
   const H = [];
   H.push(`<p><b>🧪 Roteiro de QA (gerado automaticamente)</b> — #${wi.id} ${esc(wi.title)}</p>`);
+  if (avisoSpaSemTeste) {
+    H.push('<p><b>⚠️ AVISO: PR sem teste automatizado.</b> A atividade não foi reprovada porque a mudança é restrita ao frontend (<code>Sittax.Spa</code>), mas avalie a sugestão de cobertura abaixo.</p>');
+  }
   H.push(`<p>${esc(rep.resumo_da_mudanca)}</p>`);
   H.push(`<p><b>Validação manual:</b> ${rep.precisa_validacao_manual ? '✅ NECESSÁRIA' : '➖ dispensável'} — ${esc(rep.justificativa_validacao)}</p>`);
   const ta = rep.teste_automatizado || {};
@@ -295,13 +300,25 @@ async function postComment(wiId, html) {
 
 // reprovacao por falta de teste: zero tokens de IA — deteccao por codigo + comentario + estado Rejected
 async function autoReject(wi, prs) {
+  // nao duplica comentario quando o dev devolve pra Review sem incluir teste
+  const prev = await ado(`${ORG}/${proj}/_apis/wit/workItems/${wi.id}/comments?api-version=7.1-preview.3`);
+  const jaReprovada = (prev.comments || []).some((c) => (c.text || '').includes('REPROVADO — falta de teste'));
+  if (jaReprovada) {
+    log('  ja tem comentario de reprovacao — so movendo estado, sem novo comentario');
+    await moveToRejected(wi);
+    return;
+  }
   const H = [];
   H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
   H.push(`<p>O(s) PR(s) vinculado(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) não alteram nenhum arquivo de teste (<code>/src/Tests/</code>, <code>.spec.ts</code>, <code>*Test.cs</code>).</p>`);
   H.push('<p>Inclua teste automatizado cobrindo a mudança e devolva a atividade para Review — a validação de QA será refeita automaticamente.</p>');
   H.push('<p><i>Validação automática de QA — sittax-qa-review</i></p>');
   await postComment(wi.id, H.join(''));
-  // mover para Rejected; Bugs exigem o campo "Data retorno"
+  await moveToRejected(wi);
+}
+
+async function moveToRejected(wi) {
+  // Bugs exigem o campo "Data retorno"
   const patch = [{ op: 'replace', path: '/fields/System.State', value: 'Rejected' }];
   const url = `${ORG}/${proj}/_apis/wit/workitems/${wi.id}?api-version=7.1`;
   const t = await token();
@@ -370,11 +387,25 @@ for (const id of targets) {
       prs.push(await getPrContext(ref.repoId, ref.prId));
     }
     if (!prs.length) log('  AVISO: sem PR vinculado — analise so pelo work item.');
+    let avisoSpaSemTeste = false;
     if (flags.autoReject && prs.length && prs.every((p) => !p.testFiles.length)) {
-      await autoReject(wi, prs);
-      log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
-      summary.push({ id, title: wi.title, rejeitada: true, ok: true });
-      continue;
+      const soSpa = prs.every((p) => p.files.every((f) => SPA_PATH.test(f.path)));
+      if (soSpa) {
+        avisoSpaSemTeste = true;
+        log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
+      } else {
+        const foraSpa = prs.flatMap((p) => p.files.filter((f) => !SPA_PATH.test(f.path))).slice(0, 5);
+        log(`  arquivos fora de Sittax.Spa: ${foraSpa.map((f) => f.path).join(', ') || '(nenhum?)'}`);
+        if (!flags.comment) {
+          log('  DRY-RUN (--no-comment): seria reprovada, nada postado/movido.');
+          summary.push({ id, title: wi.title, rejeitada: true, dryRun: true, ok: true });
+          continue;
+        }
+        await autoReject(wi, prs);
+        log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
+        summary.push({ id, title: wi.title, rejeitada: true, ok: true });
+        continue;
+      }
     }
     const prompt = buildPrompt(wi, prs);
     log(`  prompt: ${(prompt.length / 1000).toFixed(0)}k chars | analisando com ${flags.model}...`);
@@ -382,7 +413,7 @@ for (const id of targets) {
     const rep = extractJson(raw);
     fs.writeFileSync(path.join(dir, `wi-${id}.json`), JSON.stringify({ wi: { id: wi.id, title: wi.title }, rep }, null, 2), 'utf8');
     if (flags.comment) {
-      await postComment(id, renderHtml(wi, prs, rep));
+      await postComment(id, renderHtml(wi, prs, rep, avisoSpaSemTeste));
       log(`  ✅ comentario postado: ${ORG}/${proj}/_workitems/edit/${id}`);
       processed.add(id);
       fs.writeFileSync(processedPath, JSON.stringify([...processed]), 'utf8');
