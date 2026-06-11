@@ -101,6 +101,7 @@ async function getWorkItem(id) {
     id,
     type: f['System.WorkItemType'],
     state: f['System.State'],
+    tags: f['System.Tags'] || '',
     title: f['System.Title'],
     assignedTo: f['System.AssignedTo']?.displayName || '-',
     areaPath: f['System.AreaPath'] || '',
@@ -317,9 +318,15 @@ async function autoReject(wi, prs) {
   await moveToRejected(wi);
 }
 
+const TAG_REPROVADA = 'reprovada-sem-teste';
+
 async function moveToRejected(wi) {
   // Bugs exigem o campo "Data retorno"
   const patch = [{ op: 'replace', path: '/fields/System.State', value: 'Rejected' }];
+  // tag para metricas: filtravel em query/board por System.Tags Contains 'reprovada-sem-teste'
+  if (!(wi.tags || '').toLowerCase().includes(TAG_REPROVADA)) {
+    patch.push({ op: 'add', path: '/fields/System.Tags', value: wi.tags ? `${wi.tags}; ${TAG_REPROVADA}` : TAG_REPROVADA });
+  }
   const url = `${ORG}/${proj}/_apis/wit/workitems/${wi.id}?api-version=7.1`;
   const t = await token();
   const doPatch = (body) => fetch(url, {

@@ -62,6 +62,20 @@ for (const id of ids) {
     H.push(`<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>`);
     await ado(`${base}?api-version=7.1-preview.3`, { method: 'POST', body: { text: H.join('') } });
     console.log(`#${id}: comentario de reprovacao postado`);
+
+    // tag para metricas (filtravel por System.Tags Contains 'reprovada-sem-teste')
+    const wiUrl = `${ORG}/${proj}/_apis/wit/workitems/${id}`;
+    const wi = await ado(`${wiUrl}?api-version=7.1`);
+    const tags = wi.fields['System.Tags'] || '';
+    if (!tags.toLowerCase().includes('reprovada-sem-teste')) {
+      const t = await token();
+      await fetch(`${wiUrl}?api-version=7.1`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json-patch+json' },
+        body: JSON.stringify([{ op: 'add', path: '/fields/System.Tags', value: tags ? `${tags}; reprovada-sem-teste` : 'reprovada-sem-teste' }]),
+      });
+      console.log(`#${id}: tag reprovada-sem-teste adicionada`);
+    }
   } catch (e) {
     console.error(`#${id}: ERRO — ${e.message.slice(0, 200)}`);
   }
