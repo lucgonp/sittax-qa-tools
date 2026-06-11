@@ -1,0 +1,6 @@
+reports/
+*.log
+node_modules/
+.env
+.lock
+processed.json
