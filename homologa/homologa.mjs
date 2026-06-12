@@ -104,7 +104,8 @@ async function getChanges() {
 }
 
 async function getFile(filePath, branch) {
-  const url = `${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=branch&api-version=7.1&$format=text`;
+  const verType = /^[0-9a-f]{40}$/i.test(branch) ? 'commit' : 'branch';
+  const url = `${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=${verType}&api-version=7.1&$format=text`;
   return ado(url, true);
 }
 
@@ -338,7 +339,10 @@ async function postDiscussion(pr, rep) {
 const log = (s) => console.error(s); // progresso no stderr; relatorio no stdout
 
 const pr = await getPr();
-const branch = pr.sourceRefName.replace('refs/heads/', '');
+// PR completado tem a branch apagada — busca os arquivos pelo commit de merge
+const branch = pr.status === 'completed' && pr.lastMergeSourceCommit?.commitId
+  ? pr.lastMergeSourceCommit.commitId
+  : pr.sourceRefName.replace('refs/heads/', '');
 log(`PR #${PR_ID}: ${pr.title}`);
 log(`Branch: ${branch} (status: ${pr.status})`);
 

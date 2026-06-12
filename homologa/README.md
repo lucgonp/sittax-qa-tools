@@ -1,11 +1,14 @@
 # sittax-homologa
 
-Homologação automática de PRs de leitura de XML de NFSe municipal (Sittax).
+Homologação automática de PRs de leitura de XML de NFSe municipal (Sittax), em duas partes:
 
-No lugar de conferir na unha campo a campo, a ferramenta baixa do PR os testes e
-os XMLs de exemplo da prefeitura e pede ao Claude uma verificação **independente**:
-cada valor assertado no teste é conferido contra o XML cru — pegando o caso em que
-o dev copiou a saída do parser para os asserts (teste passa, mas pode estar errado).
+- **Parte 1 (`homologa.mjs`)** — verificação estática: baixa do PR os testes e os
+  XMLs de exemplo da prefeitura e pede ao Claude uma verificação **independente**:
+  cada valor assertado no teste é conferido contra o XML cru — pegando o caso em que
+  o dev copiou a saída do parser para os asserts (teste passa, mas pode estar errado).
+- **Parte 2 (`stage.mjs`)** — verificação end-to-end: importa os XMLs de verdade no
+  ambiente de **staging**, consulta as notas geradas via API e confere o que o
+  sistema gravou contra o que o teste espera.
 
 ## Uso
 
@@ -46,8 +49,43 @@ e bateu, e observações (ex.: typos vindos do XML da prefeitura).
 2. Contagem de notas no lote e tratamento de cancelamento.
 3. Cobertura: notas do lote e campos relevantes que o teste não confere.
 
+## Parte 2 — importação em staging (`stage.mjs`)
+
+Rode **depois que o PR foi completado e o deploy de stage subiu** (o stage executa o
+código deployado, não a branch do PR — rodar antes testa o parser antigo).
+
+```bash
+node stage.mjs 5671                # remove chaves prévias, importa, consulta e confere
+node stage.mjs 5671 --comment      # idem + posta o relatório no Discussion do work item
+node stage.mjs 5671 --dry-run      # não remove nem importa; só extrai chaves e consulta
+node stage.mjs 5671 --no-cleanup   # importa sem remover as notas antes
+node stage.mjs 5671 --comment-only # posta o reports/pr-<id>-stage.json já gerado
+```
+
+O que ela faz:
+
+1. Extrai do teste do PR as notas **esperadas** (chave de acesso + campos assertados).
+2. Remove essas chaves em stage (`api/nota-fiscal/remover-notas-fiscais-por-chaves`)
+   para a rodada ser idempotente.
+3. Importa cada fixture XML via `api/upload/importar-arquivo` (processamento
+   assíncrono via fila — a consulta faz polling de até ~1 min por chave).
+4. Consulta cada chave em `obter-nota-fiscal-entrada` e `obter-nota-fiscal-saida`
+   (saída usa o header `CnpjDaEmpresaSelecionada` com o CNPJ do prestador).
+5. Claude compara o que o sistema gravou vs o que o teste espera (tratando
+   equivalências de enum: modelo `99` = NFSE, códigos IBGE = `TipoCidadesUtil`).
+
+Saída em `reports/pr-<id>-stage.md` + `.json`.
+
+Credenciais de stage: por padrão usa o usuário `sistema` de QA (o mesmo dos testes
+Cypress); para trocar, crie um `.env` com `STAGE_USER=` e `STAGE_PASS=`.
+
+Nota: o endpoint síncrono `api/upload-homologacao/importar-arquivo` (que devolve a
+quantidade importada) **não** está exposto em `api.stage.sittax.com.br` (404) — por
+isso o upload usa o endpoint autenticado normal + polling.
+
 ## Limitações
 
-- O arquivo do leitor em si (`LeitorDeXml<Municipio>.cs`) só entra na análise se
-  estiver no diff do PR; caso contrário a verificação é só dados (XML vs asserts).
-- Não cobre a parte de importar o XML no app de staging (homologação end-to-end).
+- O arquivo do leitor em si (`LeitorDeXml<Municipio>.cs`) só entra na análise da
+  parte 1 se estiver no diff do PR; caso contrário a verificação é só dados (XML vs asserts).
+- Parte 2: se a empresa do CNPJ emitente/destinatário não estiver cadastrada em
+  stage, a nota não aparece nas telas — o relatório aponta, mas não cadastra a empresa.
