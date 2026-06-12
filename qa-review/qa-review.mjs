@@ -116,6 +116,11 @@ const CODE_EXT = /\.(cs|ts|html|scss|css|js|sql|py)$/i;
 const TEST_PATH = /\/src\/Tests\/|\.spec\.|Test\.cs$|\.test\./i;
 // mudancas SO nessa pasta (frontend) nao sao reprovadas por falta de teste — apenas aviso
 const SPA_PATH = /^\/Sittax\.Spa\//i;
+// arquivos que NAO comportam teste unitario (integracao externa / envio) — nem avisa nem reprova, so gera roteiro
+const NO_TEST_NEEDED = [
+  /\/Sittax\.Domain\/Serpro\/Services\/IntegraContadorServicesBase\.cs$/i,
+];
+const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
 
 async function fileAtBranch(base, filePath, branch) {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=branch&api-version=7.1&$format=text`, { asText: true });
@@ -257,9 +262,12 @@ RESPONDA APENAS com JSON valido:
 // ---------- render ----------
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-function renderHtml(wi, prs, rep, avisoSpaSemTeste = false) {
+function renderHtml(wi, prs, rep, avisoSpaSemTeste = false, prsInacessiveis = 0) {
   const H = [];
   H.push(`<p><b>🧪 Roteiro de QA (gerado automaticamente)</b> — #${wi.id} ${esc(wi.title)}</p>`);
+  if (prsInacessiveis) {
+    H.push(`<p><b>⚠️ Análise parcial:</b> ${prsInacessiveis} PR(s) vinculado(s) estão em repositório inacessível (deletado/movido) e foram ignorados. Verifique a cobertura de teste manualmente nesses PRs.</p>`);
+  }
   if (avisoSpaSemTeste) {
     H.push('<p><b>⚠️ AVISO: PR sem teste automatizado.</b> A atividade não foi reprovada porque a mudança é restrita ao frontend (<code>Sittax.Spa</code>), mas avalie a sugestão de cobertura abaixo.</p>');
   }
@@ -389,20 +397,42 @@ for (const id of targets) {
     const wi = await getWorkItem(id);
     log(`[${wi.type}] ${wi.title}`);
     const prs = [];
+    let prsInacessiveis = 0;
     for (const ref of wi.prRefs) {
       log(`  baixando PR #${ref.prId}...`);
-      prs.push(await getPrContext(ref.repoId, ref.prId));
+      try {
+        prs.push(await getPrContext(ref.repoId, ref.prId));
+      } catch (e) {
+        // repo deletado/movido (404) ou sem acesso — pula esse PR e segue com os demais
+        prsInacessiveis++;
+        log(`  AVISO: PR #${ref.prId} inacessivel (${(e.message || '').slice(0, 80)}) — ignorado.`);
+      }
+    }
+    if (!prs.length && wi.prRefs.length) {
+      log('  ERRO: todos os PRs vinculados estao inacessiveis — pulando atividade.');
+      summary.push({ id, ok: false, erro: 'todos os PRs inacessiveis' });
+      continue;
     }
     if (!prs.length) log('  AVISO: sem PR vinculado — analise so pelo work item.');
     let avisoSpaSemTeste = false;
-    if (flags.autoReject && prs.length && prs.every((p) => !p.testFiles.length)) {
-      const soSpa = prs.every((p) => p.files.every((f) => SPA_PATH.test(f.path)));
-      if (soSpa) {
+    // nao reprovar se algum PR ficou inacessivel — o teste pode estar no PR que nao conseguimos ler
+    if (flags.autoReject && prsInacessiveis) {
+      log('  AVISO: ha PR(s) inacessivel(is) — auto-reject desativado para esta atividade (nao da pra afirmar que falta teste).');
+    }
+    if (flags.autoReject && !prsInacessiveis && prs.length && prs.every((p) => !p.testFiles.length)) {
+      const todosArquivos = prs.flatMap((p) => p.files.map((f) => f.path));
+      // arquivos que exigiriam teste (fora de SPA e fora da lista de nao-testaveis)
+      const exigemTeste = todosArquivos.filter((p) => !SPA_PATH.test(p) && !isNoTestNeeded(p));
+      const soNaoTestaveis = todosArquivos.length > 0 && exigemTeste.length === 0 && !todosArquivos.some((p) => SPA_PATH.test(p));
+      if (soNaoTestaveis) {
+        // ex.: IntegraContadorServicesBase.cs — envio da apuracao, sem teste unitario viavel; nem avisa nem reprova
+        log('  ℹ️ sem teste, mas mudanca SO em arquivo(s) que nao comporta(m) teste unitario — roteiro normal, sem aviso/reprovacao');
+      } else if (exigemTeste.length === 0) {
+        // sobrou so SPA (eventualmente + nao-testaveis) -> aviso, sem reprovacao
         avisoSpaSemTeste = true;
         log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
       } else {
-        const foraSpa = prs.flatMap((p) => p.files.filter((f) => !SPA_PATH.test(f.path))).slice(0, 5);
-        log(`  arquivos fora de Sittax.Spa: ${foraSpa.map((f) => f.path).join(', ') || '(nenhum?)'}`);
+        log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).join(', ')}`);
         if (!flags.comment) {
           log('  DRY-RUN (--no-comment): seria reprovada, nada postado/movido.');
           summary.push({ id, title: wi.title, rejeitada: true, dryRun: true, ok: true });
@@ -420,7 +450,7 @@ for (const id of targets) {
     const rep = extractJson(raw);
     fs.writeFileSync(path.join(dir, `wi-${id}.json`), JSON.stringify({ wi: { id: wi.id, title: wi.title }, rep }, null, 2), 'utf8');
     if (flags.comment) {
-      await postComment(id, renderHtml(wi, prs, rep, avisoSpaSemTeste));
+      await postComment(id, renderHtml(wi, prs, rep, avisoSpaSemTeste, prsInacessiveis));
       log(`  ✅ comentario postado: ${ORG}/${proj}/_workitems/edit/${id}`);
       processed.add(id);
       fs.writeFileSync(processedPath, JSON.stringify([...processed]), 'utf8');
