@@ -121,6 +121,9 @@ const NO_TEST_NEEDED = [
   /\/Sittax\.Domain\/Serpro\/Services\/IntegraContadorServicesBase\.cs$/i,
 ];
 const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
+// repositorios cujos arquivos nao comportam teste unitario (E2E/UI) — isentos, igual a NO_TEST_NEEDED
+const NO_TEST_REPOS = ['sittax.ui.test'];
+const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
 
 async function fileAtBranch(base, filePath, branch) {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=branch&api-version=7.1&$format=text`, { asText: true });
@@ -168,6 +171,8 @@ async function getPrContext(repoId, prId) {
   }
   return {
     prId, repoId,
+    repoName: pr.repository?.name || '',
+    noTestRepo: isNoTestRepo(pr.repository?.name),
     title: pr.title, description: pr.description || '', branch,
     status: pr.status, author: pr.createdBy?.displayName,
     files, testFiles, excerpts,
@@ -420,10 +425,12 @@ for (const id of targets) {
       log('  AVISO: ha PR(s) inacessivel(is) — auto-reject desativado para esta atividade (nao da pra afirmar que falta teste).');
     }
     if (flags.autoReject && !prsInacessiveis && prs.length && prs.every((p) => !p.testFiles.length)) {
-      const todosArquivos = prs.flatMap((p) => p.files.map((f) => f.path));
-      // arquivos que exigiriam teste (fora de SPA e fora da lista de nao-testaveis)
-      const exigemTeste = todosArquivos.filter((p) => !SPA_PATH.test(p) && !isNoTestNeeded(p));
-      const soNaoTestaveis = todosArquivos.length > 0 && exigemTeste.length === 0 && !todosArquivos.some((p) => SPA_PATH.test(p));
+      // cada arquivo carrega se o PR dele e de um repo isento (ex.: Sittax.Ui.Test = E2E)
+      const arquivos = prs.flatMap((p) => p.files.map((f) => ({ path: f.path, isento: p.noTestRepo })));
+      // arquivos que exigiriam teste: nao isentos por repo, fora de SPA e fora da lista de nao-testaveis
+      const exigemTeste = arquivos.filter((a) => !a.isento && !SPA_PATH.test(a.path) && !isNoTestNeeded(a.path));
+      const temSpa = arquivos.some((a) => !a.isento && SPA_PATH.test(a.path));
+      const soNaoTestaveis = arquivos.length > 0 && exigemTeste.length === 0 && !temSpa;
       if (soNaoTestaveis) {
         // ex.: IntegraContadorServicesBase.cs — envio da apuracao, sem teste unitario viavel; nem avisa nem reprova
         log('  ℹ️ sem teste, mas mudanca SO em arquivo(s) que nao comporta(m) teste unitario — roteiro normal, sem aviso/reprovacao');
@@ -432,7 +439,7 @@ for (const id of targets) {
         avisoSpaSemTeste = true;
         log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
       } else {
-        log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).join(', ')}`);
+        log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).map((a) => a.path).join(', ')}`);
         if (!flags.comment) {
           log('  DRY-RUN (--no-comment): seria reprovada, nada postado/movido.');
           summary.push({ id, title: wi.title, rejeitada: true, dryRun: true, ok: true });
