@@ -51,8 +51,9 @@ if (fs.existsSync(envPath)) {
     if (m) env[m[1]] = m[2].replace(/^["']|["']$/g, '');
   }
 }
-const STAGE_USER = env.STAGE_USER || 'sistema@sittax.com.br';
-const STAGE_PASS = env.STAGE_PASS || 'senhas';
+// precedencia: variavel de ambiente (pipeline) > .env (local) > usuario sistema de QA
+const STAGE_USER = process.env.STAGE_USER || env.STAGE_USER || 'sistema@sittax.com.br';
+const STAGE_PASS = process.env.STAGE_PASS || env.STAGE_PASS || 'senhas';
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
@@ -83,6 +84,9 @@ const log = (s) => console.error(s);
 let _adoToken = null;
 async function adoToken() {
   if (_adoToken) return _adoToken;
+  // em pipeline: ADO_TOKEN=$(System.AccessToken); local: az login
+  const envTok = process.env.ADO_TOKEN || process.env.SYSTEM_ACCESSTOKEN;
+  if (envTok) return (_adoToken = envTok.trim());
   const { stdout } = await execFileP('az', [
     'account', 'get-access-token', '--resource', ADO_RESOURCE, '--query', 'accessToken', '-o', 'tsv',
   ], { maxBuffer: 4 * 1024 * 1024 });

@@ -62,6 +62,9 @@ const REPO = repoMatch ? repoMatch[1] : DEFAULT_REPO;
 let _token = null;
 async function token() {
   if (_token) return _token;
+  // em pipeline: ADO_TOKEN=$(System.AccessToken); local: az login
+  const envTok = process.env.ADO_TOKEN || process.env.SYSTEM_ACCESSTOKEN;
+  if (envTok) return (_token = envTok.trim());
   const { stdout } = await execFileP('az', [
     'account', 'get-access-token', '--resource', ADO_RESOURCE, '--query', 'accessToken', '-o', 'tsv',
   ], { maxBuffer: 4 * 1024 * 1024 });

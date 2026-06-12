@@ -1,0 +1,144 @@
+# =====================================================================
+# Homologação automática de PRs de leitura de XML NFSe (sittax-homologa)
+# =====================================================================
+# Pipeline MANUAL: Pipelines → "Homologa NFSe" → Run pipeline → informe o PR.
+#
+#   Parte 1 — confere os asserts do teste contra o XML cru da prefeitura
+#             (pode rodar a qualquer momento, assim que o PR abre).
+#   Parte 2 — importa os XMLs DE VERDADE em staging e confere as notas via API.
+#             ⚠️ SÓ rodar depois do PR completado + deploy de stage!
+#
+# Variáveis do pipeline (Edit → Variables):
+#   CLAUDE_CODE_OAUTH_TOKEN  (secret) — gere com `claude setup-token`
+#                            (alternativa: ANTHROPIC_API_KEY)
+#   STAGE_USER / STAGE_PASS  (opcional) — default: usuário sistema de QA
+#
+# Permissões do build service (<projeto> Build Service):
+#   - Read no repo Sittax (baixa testes/fixtures do PR)
+#   - Edit work items (posta o relatório no Discussion)
+#
+# Relatórios ficam na aba Artifacts do run (homologa-reports).
+# Docs completas: tools/homologa/DOCS.md
+
+trigger: none
+pr: none
+
+parameters:
+- name: prId
+  displayName: 'PR de homologação (id numérico, repo Sittax)'
+  type: string
+
+- name: parte
+  displayName: 'O que rodar'
+  type: string
+  default: parte1
+  values:
+    - parte1          # XML cru vs asserts — qualquer momento
+    - parte2          # importa em staging — APÓS deploy de stage
+    - parte1+parte2
+
+- name: comment
+  displayName: 'Postar relatório no Discussion do work item'
+  type: boolean
+  default: true
+
+- name: dryRun
+  displayName: 'Parte 2 em dry-run (não remove nem importa, só consulta)'
+  type: boolean
+  default: false
+
+- name: model
+  displayName: 'Modelo'
+  type: string
+  default: claude-sonnet-4-6
+  values:
+    - claude-sonnet-4-6
+    - claude-fable-5
+
+- name: image
+  displayName: Pool
+  type: string
+  default: Automatizados
+  values:
+    - Quality
+    - Automatizados
+    - Azure Pipelines
+
+name: homologa-pr${{ parameters.prId }}-$(Date:yyyyMMdd)$(Rev:.r)
+
+pool:
+  vmImage: 'ubuntu-latest'
+  name: ${{ parameters.image }}
+
+jobs:
+- job: homologa
+  displayName: 'Homologa PR #${{ parameters.prId }} (${{ parameters.parte }})'
+  timeoutInMinutes: 45
+  steps:
+  - checkout: self
+    fetchDepth: 1
+
+  - task: NodeTool@0
+    inputs:
+      versionSpec: '20.x'
+    displayName: 'Node 20'
+
+  - bash: npm install -g @anthropic-ai/claude-code && claude --version
+    displayName: 'Instalar Claude CLI'
+
+  - ${{ if in(parameters.parte, 'parte1', 'parte1+parte2') }}:
+    - bash: |
+        set -e
+        # variável de pipeline não definida chega como o literal "$(NOME)" — descarta
+        case "$CLAUDE_CODE_OAUTH_TOKEN" in '$('*) unset CLAUDE_CODE_OAUTH_TOKEN;; esac
+        case "$ANTHROPIC_API_KEY"      in '$('*) unset ANTHROPIC_API_KEY;;      esac
+        if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+          echo "##vso[task.logissue type=error]Defina a variável secreta CLAUDE_CODE_OAUTH_TOKEN (gerada com 'claude setup-token') ou ANTHROPIC_API_KEY no pipeline."
+          exit 1
+        fi
+        FLAGS="--model $MODEL"
+        [ "$COMMENT" = "True" ] && FLAGS="$FLAGS --comment"
+        node tools/homologa/homologa.mjs "$PR_ID" $FLAGS
+      displayName: 'Parte 1 — XML cru vs asserts'
+      env:
+        PR_ID: ${{ parameters.prId }}
+        MODEL: ${{ parameters.model }}
+        COMMENT: ${{ parameters.comment }}
+        ADO_TOKEN: $(System.AccessToken)
+        CLAUDE_CODE_OAUTH_TOKEN: $(CLAUDE_CODE_OAUTH_TOKEN)
+        ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+
+  - ${{ if in(parameters.parte, 'parte2', 'parte1+parte2') }}:
+    - bash: |
+        set -e
+        case "$CLAUDE_CODE_OAUTH_TOKEN" in '$('*) unset CLAUDE_CODE_OAUTH_TOKEN;; esac
+        case "$ANTHROPIC_API_KEY"      in '$('*) unset ANTHROPIC_API_KEY;;      esac
+        case "$STAGE_USER"             in '$('*) unset STAGE_USER;;             esac
+        case "$STAGE_PASS"             in '$('*) unset STAGE_PASS;;             esac
+        if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+          echo "##vso[task.logissue type=error]Defina a variável secreta CLAUDE_CODE_OAUTH_TOKEN (gerada com 'claude setup-token') ou ANTHROPIC_API_KEY no pipeline."
+          exit 1
+        fi
+        FLAGS="--model $MODEL"
+        [ "$COMMENT" = "True" ] && FLAGS="$FLAGS --comment"
+        [ "$DRYRUN" = "True" ] && FLAGS="$FLAGS --dry-run"
+        node tools/homologa/stage.mjs "$PR_ID" $FLAGS
+      displayName: 'Parte 2 — importação em staging'
+      env:
+        PR_ID: ${{ parameters.prId }}
+        MODEL: ${{ parameters.model }}
+        COMMENT: ${{ parameters.comment }}
+        DRYRUN: ${{ parameters.dryRun }}
+        ADO_TOKEN: $(System.AccessToken)
+        CLAUDE_CODE_OAUTH_TOKEN: $(CLAUDE_CODE_OAUTH_TOKEN)
+        ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+        STAGE_USER: $(STAGE_USER)
+        STAGE_PASS: $(STAGE_PASS)
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publicar relatórios'
+    inputs:
+      pathToPublish: 'tools/homologa/reports'
+      artifactName: 'homologa-reports'
+    condition: always()
+    continueOnError: true
