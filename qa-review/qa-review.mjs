@@ -125,8 +125,8 @@ const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
 
-async function fileAtBranch(base, filePath, branch) {
-  return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(branch)}&versionDescriptor.versionType=branch&api-version=7.1&$format=text`, { asText: true });
+async function fileAtBranch(base, filePath, version, versionType = 'branch') {
+  return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(version)}&versionDescriptor.versionType=${versionType}&api-version=7.1&$format=text`, { asText: true });
 }
 
 // diff unificado local entre base e head — manda so o que mudou, nao o arquivo inteiro
@@ -147,6 +147,10 @@ async function getPrContext(repoId, prId) {
   const pr = await ado(`${base}/pullRequests/${prId}?api-version=7.1`);
   const branch = pr.sourceRefName.replace('refs/heads/', '');
   const targetBranch = pr.targetRefName.replace('refs/heads/', '');
+  // PR completado tem a branch de origem apagada -> le os arquivos pelo commit de merge
+  const headVer = pr.status === 'completed' && pr.lastMergeSourceCommit?.commitId
+    ? { value: pr.lastMergeSourceCommit.commitId, type: 'commit' }
+    : { value: branch, type: 'branch' };
   const iters = await ado(`${base}/pullRequests/${prId}/iterations?api-version=7.1`);
   const last = iters.value[iters.value.length - 1].id;
   const ch = await ado(`${base}/pullRequests/${prId}/iterations/${last}/changes?api-version=7.1&$top=300&$compareTo=0`);
@@ -155,27 +159,35 @@ async function getPrContext(repoId, prId) {
   const testFiles = files.filter((f) => TEST_PATH.test(f.path));
   const codeFiles = files.filter((f) => CODE_EXT.test(f.path) && !TEST_PATH.test(f.path) && f.changeType !== 'delete');
 
-  const excerpts = [];
-  for (const f of codeFiles.slice(0, MAX_FILES_PER_PR)) {
-    try {
-      const head = await fileAtBranch(base, f.path, branch);
-      if (/add/.test(f.changeType)) {
-        excerpts.push({ path: f.path, kind: 'arquivo novo', content: head.length > MAX_FILE_CHARS ? head.slice(0, MAX_FILE_CHARS) + '\n...[TRUNCADO]' : head });
-      } else {
-        const baseTxt = await fileAtBranch(base, f.path, targetBranch).catch(() => '');
-        let d = await unifiedDiff(baseTxt, head);
-        if (d.length > MAX_DIFF_CHARS) d = d.slice(0, MAX_DIFF_CHARS) + '\n...[DIFF TRUNCADO]';
-        excerpts.push({ path: f.path, kind: 'diff', content: d || '(sem diferencas no conteudo)' });
-      }
-    } catch { /* arquivo binario ou inacessivel */ }
+  // baixa o conteudo (diff ou arquivo novo) de uma lista de arquivos do PR
+  async function excerptsFor(list, limit) {
+    const out = [];
+    for (const f of list.slice(0, limit)) {
+      if (f.changeType === 'delete') continue;
+      try {
+        const head = await fileAtBranch(base, f.path, headVer.value, headVer.type);
+        if (/add/.test(f.changeType)) {
+          out.push({ path: f.path, kind: 'arquivo novo', content: head.length > MAX_FILE_CHARS ? head.slice(0, MAX_FILE_CHARS) + '\n...[TRUNCADO]' : head });
+        } else {
+          const baseTxt = await fileAtBranch(base, f.path, targetBranch).catch(() => '');
+          let d = await unifiedDiff(baseTxt, head);
+          if (d.length > MAX_DIFF_CHARS) d = d.slice(0, MAX_DIFF_CHARS) + '\n...[DIFF TRUNCADO]';
+          out.push({ path: f.path, kind: 'diff', content: d || '(sem diferencas no conteudo)' });
+        }
+      } catch { /* arquivo binario ou inacessivel */ }
+    }
+    return out;
   }
+  const excerpts = await excerptsFor(codeFiles, MAX_FILES_PER_PR);
+  // conteudo dos arquivos de teste: necessario para avaliar se o teste COBRE o criterio (nao so se existe)
+  const testExcerpts = await excerptsFor(testFiles, MAX_FILES_PER_PR);
   return {
     prId, repoId,
     repoName: pr.repository?.name || '',
     noTestRepo: isNoTestRepo(pr.repository?.name),
     title: pr.title, description: pr.description || '', branch,
     status: pr.status, author: pr.createdBy?.displayName,
-    files, testFiles, excerpts,
+    files, testFiles, excerpts, testExcerpts,
     url: `${ORG}/${proj}/_git/${pr.repository?.name || repoId}/pullrequest/${prId}`,
   };
 }
@@ -217,7 +229,11 @@ function buildPrompt(wi, prs) {
       ? `SIM — arquivos de teste no PR:\n${pr.testFiles.map((f) => f.path).join('\n')}`
       : 'NAO — o PR nao altera nenhum arquivo de teste';
     const code = pr.excerpts.map((e) => `--- ${e.path} (${e.kind}) ---\n${e.content}`).join('\n\n');
-    return `### PR #${pr.prId}: ${pr.title}\nBranch: ${pr.branch} | Status: ${pr.status} | Autor: ${pr.author}\nDescricao: ${pr.description}\n\nARQUIVOS ALTERADOS:\n${fileList}\n\nPR INCLUI TESTE AUTOMATIZADO? ${tests}\n\nMUDANCAS (diff unificado por arquivo; arquivos novos vem inteiros):\n${code}`;
+    const testCode = pr.testExcerpts?.length
+      ? '\n\nCONTEUDO DOS TESTES DO PR (avalie se COBREM a mudanca, nao so se existem):\n' +
+        pr.testExcerpts.map((e) => `--- ${e.path} (${e.kind}) ---\n${e.content}`).join('\n\n')
+      : '';
+    return `### PR #${pr.prId}: ${pr.title}\nBranch: ${pr.branch} | Status: ${pr.status} | Autor: ${pr.author}\nDescricao: ${pr.description}\n\nARQUIVOS ALTERADOS:\n${fileList}\n\nPR INCLUI TESTE AUTOMATIZADO? ${tests}\n\nMUDANCAS (diff unificado por arquivo; arquivos novos vem inteiros):\n${code}${testCode}`;
   }).join('\n\n');
 
   return `Voce e um analista de QA senior do Sittax (sistema fiscal/contabil SaaS: importacao de XML de notas, apuracao de impostos, Simples Nacional, DIFAL, transmissao de declaracoes, painel web Angular).
@@ -240,6 +256,7 @@ REGRAS:
 2. Derive os cenarios do DIFF: o que exatamente mudou de comportamento? Teste o caso corrigido E os casos vizinhos que podem ter regredido.
 3. "precisa_validacao_manual": false somente se a mudanca for totalmente coberta por teste automatizado confiavel E sem efeito visual/fluxo (raro). Em geral bugs de calculo/exibicao precisam validacao manual.
 4. "teste_automatizado": diga se o PR ja inclui teste (fato informado acima), se DEVERIA incluir e o que exatamente deveria ser coberto (classe/cenario). Para mudanca de frontend visual, teste automatizado pode ser dispensavel — justifique.
+4b. "qualidade_do_teste" (so quando o PR inclui teste): com o CONTEUDO dos testes em maos, avalie se eles realmente COBREM o cenario corrigido e os criterios de aceite — nao basta existir. Marque "cobre_criterio": false e severidade quando o teste for fraco (ex.: assert trivial tipo Assert.True(true); testa um caminho diferente do bug; sem assert no valor que mudou; mocka justamente a parte corrigida; nao cobre o cenario dos criterios de aceite). Isto e um AVISO para o QA olhar de perto, NAO uma reprovacao. Se nao houver teste no PR, retorne "qualidade_do_teste": null.
 5. Se a descricao da atividade estiver vazia, infira o contexto pelo titulo e pelo codigo, e diga no campo "observacoes" que a atividade esta sem descricao/criterios de aceite (isso e um problema de processo).
 6. Senha/login, URLs internas e dados reais voce NAO conhece — escreva os passos de forma parametrizada ("acesse o painel como escritorio X com configuracao Y").
 7. SEJA CONCISO: campos de texto com 1-2 frases; no maximo 10 passos de teste e 4 cenarios de regressao; nao repita a descricao da atividade; sem preambulo.
@@ -258,6 +275,11 @@ RESPONDA APENAS com JSON valido:
     "necessario": true|false,
     "justificativa": "...",
     "sugestao": "o que cobrir e onde (ex.: teste unitario em X cobrindo cenario Y), ou null"
+  },
+  "qualidade_do_teste": {
+    "cobre_criterio": true|false,
+    "severidade": "alta|media|baixa",
+    "analise": "1-2 frases: o que o teste cobre de fato e o que falta para validar a mudanca/criterio de aceite"
   },
   "riscos": [ "..." ],
   "observacoes": [ "..." ]
@@ -280,6 +302,14 @@ function renderHtml(wi, prs, rep, avisoSpaSemTeste = false, prsInacessiveis = 0)
   H.push(`<p><b>Validação manual:</b> ${rep.precisa_validacao_manual ? '✅ NECESSÁRIA' : '➖ dispensável'} — ${esc(rep.justificativa_validacao)}</p>`);
   const ta = rep.teste_automatizado || {};
   H.push(`<p><b>Teste automatizado:</b> PR ${ta.pr_ja_inclui ? 'JÁ INCLUI ✅' : 'NÃO inclui ❌'} | ${ta.necessario ? 'necessário' : 'dispensável'} — ${esc(ta.justificativa)}${ta.sugestao ? ` <i>Sugestão: ${esc(ta.sugestao)}</i>` : ''}</p>`);
+  // aviso de qualidade do teste: o PR tem teste, mas ele pode nao cobrir o que mudou (nao reprova, alerta)
+  const qt = rep.qualidade_do_teste;
+  if (qt && qt.cobre_criterio === false) {
+    const sevIcon = { alta: '🔴', media: '🟠', baixa: '🟡' };
+    H.push(`<p><b>${sevIcon[qt.severidade] || '⚠️'} Atenção — qualidade do teste:</b> o PR inclui teste, mas pode não cobrir a mudança. ${esc(qt.analise)} <i>(valide manualmente este ponto)</i></p>`);
+  } else if (qt && qt.cobre_criterio === true) {
+    H.push(`<p><b>✅ Qualidade do teste:</b> ${esc(qt.analise)}</p>`);
+  }
   if (rep.passos_de_teste?.length) {
     H.push('<p><b>Passo a passo:</b></p><ol>');
     for (const p of rep.passos_de_teste) {
@@ -462,7 +492,7 @@ for (const id of targets) {
       processed.add(id);
       fs.writeFileSync(processedPath, JSON.stringify([...processed]), 'utf8');
     }
-    summary.push({ id, title: wi.title, manual: rep.precisa_validacao_manual, temTeste: rep.teste_automatizado?.pr_ja_inclui, precisaTeste: rep.teste_automatizado?.necessario, passos: rep.passos_de_teste?.length || 0, ok: true });
+    summary.push({ id, title: wi.title, manual: rep.precisa_validacao_manual, temTeste: rep.teste_automatizado?.pr_ja_inclui, precisaTeste: rep.teste_automatizado?.necessario, testeFraco: rep.qualidade_do_teste?.cobre_criterio === false, passos: rep.passos_de_teste?.length || 0, ok: true });
   } catch (e) {
     log(`  ❌ ERRO em #${id}: ${e.message.slice(0, 300)}`);
     summary.push({ id, ok: false, erro: e.message.slice(0, 200) });
@@ -474,5 +504,5 @@ console.log('\n===== RESUMO =====');
 for (const s of summary) {
   if (!s.ok) { console.log(`#${s.id}: ERRO — ${s.erro}`); continue; }
   if (s.rejeitada) { console.log(`#${s.id}: ❌ REPROVADA (sem teste no PR, sem gasto de IA) | ${s.title.slice(0, 70)}`); continue; }
-  console.log(`#${s.id}: ${s.passos} passos | manual: ${s.manual ? 'SIM' : 'nao'} | PR tem teste: ${s.temTeste ? 'sim' : 'NAO'} | teste necessario: ${s.precisaTeste ? 'SIM' : 'nao'} | ${s.title.slice(0, 70)}`);
+  console.log(`#${s.id}: ${s.passos} passos | manual: ${s.manual ? 'SIM' : 'nao'} | PR tem teste: ${s.temTeste ? 'sim' : 'NAO'}${s.testeFraco ? ' (⚠️ FRACO)' : ''} | teste necessario: ${s.precisaTeste ? 'SIM' : 'nao'} | ${s.title.slice(0, 70)}`);
 }
