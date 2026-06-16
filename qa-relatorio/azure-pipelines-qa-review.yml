@@ -1,0 +1,53 @@
+# =====================================================================
+# QA Review server-side — roteiro de QA + auto-reject (sittax-qa-review)
+# =====================================================================
+# Roda AGENDADO no Azure DevOps (sem depender da máquina do Lucas). Para cada
+# atividade nova em Review: gera roteiro de QA + avalia qualidade do teste, e
+# reprova PR sem teste (auto-reject). Substitui o watcher local (Tarefa do Windows).
+#
+# Cadência: a cada 30 min em horário comercial (seg–sex). Azure scheduled triggers
+# não garantem precisão sub-horária fina; para feedback mais rápido, manter também
+# o watcher local como reforço, ou reduzir o cron.
+#
+# Setup (uma vez): criar o pipeline apontando para este YAML; variável secreta
+# CLAUDE_CODE_OAUTH_TOKEN (ou ANTHROPIC_API_KEY); build service com Edit work items.
+
+trigger: none
+pr: none
+
+schedules:
+- cron: '0,30 11-22 * * 1-5'   # UTC (~08:00–19:30 BRT), seg–sex
+  displayName: 'A cada 30min em horário comercial'
+  branches: { include: [ main ] }
+  always: true
+
+pool:
+  vmImage: 'ubuntu-latest'
+  name: Automatizados
+
+jobs:
+- job: qa_review
+  displayName: 'QA Review — fila Review'
+  timeoutInMinutes: 40
+  steps:
+  - checkout: self
+    fetchDepth: 1
+  - task: NodeTool@0
+    inputs: { versionSpec: '20.x' }
+    displayName: 'Node 20'
+  - bash: npm install -g @anthropic-ai/claude-code && claude --version
+    displayName: 'Instalar Claude CLI'
+  - bash: |
+      set -e
+      case "$CLAUDE_CODE_OAUTH_TOKEN" in '$('*) unset CLAUDE_CODE_OAUTH_TOKEN;; esac
+      case "$ANTHROPIC_API_KEY"      in '$('*) unset ANTHROPIC_API_KEY;;      esac
+      if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+        echo "##vso[task.logissue type=error]Defina CLAUDE_CODE_OAUTH_TOKEN (claude setup-token) ou ANTHROPIC_API_KEY."
+        exit 1
+      fi
+      node tools/qa-review/qa-review.mjs --queue --new-only --auto-reject
+    displayName: 'qa-review --queue --new-only --auto-reject'
+    env:
+      ADO_TOKEN: $(System.AccessToken)
+      CLAUDE_CODE_OAUTH_TOKEN: $(CLAUDE_CODE_OAUTH_TOKEN)
+      ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)

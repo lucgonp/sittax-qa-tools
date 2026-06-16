@@ -1,0 +1,57 @@
+# =====================================================================
+# Relatório Semanal de QA server-side (sittax-qa-relatorio)
+# =====================================================================
+# Roda AGENDADO no Azure DevOps toda segunda de manhã: gera o relatório da semana
+# passada (números do Azure DevOps + narrativa Claude) e PUBLICA na wiki do projeto
+# (+ Teams se TEAMS_WEBHOOK estiver definido). Independe da máquina do Lucas.
+#
+# Setup (uma vez): criar o pipeline apontando para este YAML; variável secreta
+# CLAUDE_CODE_OAUTH_TOKEN (ou ANTHROPIC_API_KEY); opcional TEAMS_WEBHOOK; build
+# service com permissão de Edit na Wiki do projeto.
+
+trigger: none
+pr: none
+
+schedules:
+- cron: '0 11 * * 1'   # UTC ~08:00 BRT, toda segunda
+  displayName: 'Segunda 08:00 BRT'
+  branches: { include: [ main ] }
+  always: true
+
+pool:
+  vmImage: 'ubuntu-latest'
+  name: Automatizados
+
+jobs:
+- job: relatorio
+  displayName: 'Relatório Semanal de QA'
+  timeoutInMinutes: 30
+  steps:
+  - checkout: self
+    fetchDepth: 1
+  - task: NodeTool@0
+    inputs: { versionSpec: '20.x' }
+    displayName: 'Node 20'
+  - bash: npm install -g @anthropic-ai/claude-code && claude --version
+    displayName: 'Instalar Claude CLI'
+  - bash: |
+      set -e
+      case "$CLAUDE_CODE_OAUTH_TOKEN" in '$('*) unset CLAUDE_CODE_OAUTH_TOKEN;; esac
+      case "$ANTHROPIC_API_KEY"      in '$('*) unset ANTHROPIC_API_KEY;;      esac
+      case "$TEAMS_WEBHOOK"          in '$('*) unset TEAMS_WEBHOOK;;          esac
+      if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+        echo "##vso[task.logissue type=error]Defina CLAUDE_CODE_OAUTH_TOKEN (claude setup-token) ou ANTHROPIC_API_KEY."
+        exit 1
+      fi
+      node tools/qa-relatorio/relatorio.mjs --publish --no-copy
+    displayName: 'relatorio --publish (wiki + Teams)'
+    env:
+      ADO_TOKEN: $(System.AccessToken)
+      CLAUDE_CODE_OAUTH_TOKEN: $(CLAUDE_CODE_OAUTH_TOKEN)
+      ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+      TEAMS_WEBHOOK: $(TEAMS_WEBHOOK)
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publicar .md/.json do relatório'
+    inputs: { pathToPublish: 'tools/qa-relatorio/reports', artifactName: 'relatorio-qa' }
+    condition: always()
+    continueOnError: true

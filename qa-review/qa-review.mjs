@@ -54,11 +54,14 @@ const log = (s) => console.error(s);
 let _token = null;
 async function token() {
   if (_token) return _token;
+  // em pipeline: ADO_TOKEN=$(System.AccessToken); local: az login
+  const envTok = process.env.ADO_TOKEN || process.env.SYSTEM_ACCESSTOKEN;
+  if (envTok) return (_token = envTok.trim());
   const { stdout } = await execFileP('az', [
     'account', 'get-access-token', '--resource', ADO_RESOURCE, '--query', 'accessToken', '-o', 'tsv',
   ], { maxBuffer: 4 * 1024 * 1024 });
   _token = stdout.trim();
-  if (!_token) throw new Error('Token vazio do az. Rode: az login');
+  if (!_token) throw new Error('Token vazio do az. Rode: az login (ou defina ADO_TOKEN).');
   return _token;
 }
 

@@ -27,7 +27,7 @@ const proj = encodeURIComponent(PROJECT);
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
-const flags = { model: 'claude-sonnet-4-6', claude: true, weekStart: null, copyTo: '/mnt/c/Users/New User/Desktop' };
+const flags = { model: 'claude-sonnet-4-6', claude: true, weekStart: null, copyTo: '/mnt/c/Users/New User/Desktop', publish: false };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--model') flags.model = argv[++i];
@@ -35,7 +35,10 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--week-start') flags.weekStart = argv[++i];
   else if (a === '--copy-to') flags.copyTo = argv[++i]; // pasta extra p/ copiar o .md (ex.: Area de Trabalho)
   else if (a === '--no-copy') flags.copyTo = '';
+  else if (a === '--publish') flags.publish = true; // publica na wiki do Azure DevOps + Teams (se TEAMS_WEBHOOK)
 }
+if (process.env.QA_PUBLISH === '1') flags.publish = true;
+const TEAMS_WEBHOOK = process.env.TEAMS_WEBHOOK || '';
 
 // ---------- janela de datas (segunda 00:00 UTC a segunda seguinte) ----------
 function lastMondayUTC(ref) {
@@ -79,6 +82,42 @@ async function ado(url, opts = {}) {
   if (!res.ok) throw new Error(`Azure ${opts.method || 'GET'} ${res.status}: ${(await res.text()).slice(0, 200)}`);
   return res.json();
 }
+// ---------- publicacao (wiki ADO + Teams) ----------
+async function getProjectWikiId() {
+  const r = await ado(`${ORG}/${proj}/_apis/wiki/wikis?api-version=7.1`);
+  const w = (r.value || []).find((x) => x.type === 'projectWiki') || (r.value || [])[0];
+  return w?.id || null;
+}
+// cria/atualiza uma pagina da wiki (markdown), idempotente via ETag.
+async function putWikiPage(wikiId, pagePath, content) {
+  const t = await token();
+  const base = `${ORG}/${proj}/_apis/wiki/wikis/${wikiId}/pages?path=${encodeURIComponent(pagePath)}&api-version=7.1`;
+  let etag = null;
+  const head = await fetch(base, { headers: { Authorization: `Bearer ${t}` } });
+  if (head.ok) etag = head.headers.get('etag');
+  const res = await fetch(base, {
+    method: 'PUT',
+    headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json', ...(etag ? { 'If-Match': etag } : {}) },
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) throw new Error(`wiki PUT ${res.status} (${pagePath}): ${(await res.text()).slice(0, 160)}`);
+  return res;
+}
+async function publishWiki(parentPath, pagePath, content) {
+  const wikiId = await getProjectWikiId();
+  if (!wikiId) throw new Error('projeto sem wiki');
+  // garante a pagina-pai (a wiki exige ancestrais; PUT em pagina inexistente como indice e idempotente)
+  await putWikiPage(wikiId, parentPath, '# Relatórios semanais de QA\n\nÍndice gerado automaticamente. Cada página filha é uma semana.').catch(() => {});
+  await putWikiPage(wikiId, pagePath, content);
+  return `${ORG}/${proj}/_wiki/wikis/${wikiId}?pagePath=${encodeURIComponent(pagePath)}`;
+}
+async function publishTeams(text) {
+  if (!TEAMS_WEBHOOK) return false;
+  const res = await fetch(TEAMS_WEBHOOK, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+  if (!res.ok) throw new Error(`Teams ${res.status}`);
+  return true;
+}
+
 async function wiqlIds(query) {
   const r = await ado(`${ORG}/${proj}/_apis/wit/wiql?api-version=7.1`, { method: 'POST', body: { query } });
   return (r.workItems || []).map((w) => w.id);
@@ -113,6 +152,28 @@ async function coletaJanela(a, b) {
     wiqlIds(`SELECT [System.Id] FROM WorkItems WHERE ${PJ} AND [System.Tags] CONTAINS 'reincidente' AND ${W('System.ChangedDate', a, b)}`),
   ]);
   return { criados, resolvidos, producao, qaCriados, testcases, reprovadas, reincidentes };
+}
+
+// Resultados de teste do CI (Test Runs do ADO). Janela <= 7 dias (limite da API).
+// Classifica em Unit (.NET/VSTest) vs E2E (Cypress/Jenkins) e pega a execucao MAIS
+// COMPLETA de cada tipo (evita somar re-runs/abortados). Proxy real de cobertura.
+async function ciTestes(a, b) {
+  let runs = [];
+  try {
+    const r = await ado(`${ORG}/${proj}/_apis/test/runs?minLastUpdatedDate=${iso(a)}&maxLastUpdatedDate=${iso(b)}&api-version=7.1`);
+    runs = r.value || [];
+  } catch { return null; }
+  if (!runs.length) return { disponivel: false };
+  const classifica = (n) => /vstest|testresults_/i.test(n) ? 'unit' : (/jenkins|cypress|ui\.test|e2e/i.test(n) ? 'e2e' : 'outros');
+  const cat = { unit: [], e2e: [], outros: [] };
+  for (const r of runs) cat[classifica(r.name || '')].push(r);
+  const resumo = (arr) => {
+    if (!arr.length) return null;
+    const full = arr.reduce((m, r) => ((r.totalTests || 0) > (m.totalTests || 0) ? r : m), arr[0]);
+    const total = full.totalTests || 0, pass = full.passedTests || 0;
+    return { execucoes: arr.length, total, pass, falhas: total - pass, taxa: total ? Math.round((pass / total) * 100) : 0, run: full.name };
+  };
+  return { disponivel: true, unit: resumo(cat.unit), e2e: resumo(cat.e2e) };
 }
 
 async function prsCompletados(a, b) {
@@ -158,8 +219,9 @@ async function main() {
   const cur = await coletaJanela(weekStart, weekEnd);
   console.error('Coletando semana anterior (comparativo)...');
   const prev = await coletaJanela(prevStart, weekStart);
-  console.error('PRs e snapshot de Review...');
+  console.error('PRs, snapshot de Review e testes do CI...');
   const prs = await prsCompletados(weekStart, weekEnd);
+  const ci = await ciTestes(weekStart, weekEnd);
   const emReviewIds = await wiqlIds(`SELECT [System.Id] FROM WorkItems WHERE ${PJ} AND [System.WorkItemType] IN ('Bug','SI BUG','Product Backlog Item','SI PBI') AND [System.State] = 'Review'`);
 
   // detalhe dos work items da semana-alvo
@@ -191,6 +253,7 @@ async function main() {
     por_produto_criados: dist(fcriados, 'Custom.Produto'),
     por_produto_resolvidos: dist(fresolvidos, 'Custom.Produto'),
     por_area: dist(fcriados, 'Custom.Area').slice(0, 8),
+    ci_testes: ci,
     por_estado: dist(fcriados, 'System.State'),
     criticos_detalhe: criticos.map((w) => ({ id: w.id, t: F(w, 'System.Title'), estado: F(w, 'System.State'), prod: F(w, 'Custom.Produto'), area: F(w, 'Custom.Area') })),
     review_detalhe: dist(femReview, 'System.WorkItemType'),
@@ -265,7 +328,15 @@ RESPONDA APENAS com JSON valido:
   L.push('## 3. Cobertura e Automação');
   L.push('');
   L.push(`- Novos testes automatizados (Test Case / Teste E2E): **${metrics.testes_novos.atual}** (${delta(metrics.testes_novos.atual, metrics.testes_novos.anterior)})`);
-  L.push('- Cobertura % por produto: ⚠️ não instrumentada (ver CONVENCOES-TAGS.md)');
+  const ci2 = metrics.ci_testes;
+  if (ci2?.disponivel) {
+    const linha = (label, r) => r ? `  - ${label}: **${r.total}** testes, **${r.taxa}%** verdes (${r.falhas} falha(s); ${r.execucoes} execução(ões) na semana)` : null;
+    L.push('- Testes executados no CI (execução mais completa da semana):');
+    [linha('Unitários (.NET)', ci2.unit), linha('E2E (Cypress)', ci2.e2e)].filter(Boolean).forEach((s) => L.push(s));
+  } else {
+    L.push('- Testes executados no CI: ⚠️ sem execução na janela');
+  }
+  L.push('- Cobertura % por produto: ⚠️ ainda não instrumentada por produto (CI não rotula por produto) — números acima são saúde global da automação');
   L.push('');
   L.push('**Bugs por produto (proxy):**');
   L.push('');
@@ -336,6 +407,29 @@ RESPONDA APENAS com JSON valido:
       fs.copyFileSync(path.join(dir, `${stem}.md`), path.join(flags.copyTo, `${stem}.md`));
       console.error(`Copia na Area de Trabalho: ${flags.copyTo}/${stem}.md`);
     } catch (e) { console.error(`(nao consegui copiar para ${flags.copyTo}: ${e.message})`); }
+  }
+
+  // ---------- publicacao pro time ----------
+  if (flags.publish) {
+    const parentPath = '/Relatórios QA';
+    const pagePath = `${parentPath}/${ymd(weekStart)} a ${ymd(weekEndDisplay)}`;
+    let wikiUrl = null;
+    try {
+      wikiUrl = await publishWiki(parentPath, pagePath, L.join('\n'));
+      console.error(`Publicado na wiki: ${wikiUrl}`);
+    } catch (e) { console.error(`(falha ao publicar na wiki: ${e.message})`); }
+    // resumo curto no Teams, com link pra wiki
+    if (TEAMS_WEBHOOK) {
+      const st = narr?.status ? (statusIcon[narr.status] || narr.status) : '';
+      const resumo = [
+        `📊 **Relatório Semanal de QA — ${dmy(weekStart)} a ${dmy(weekEndDisplay)}** ${st}`,
+        `Bugs: ${metrics.bugs_criados.atual} criados (${delta(metrics.bugs_criados.atual, metrics.bugs_criados.anterior)}) · ${metrics.bugs_resolvidos.atual} validados · ${metrics.criticos} crítico(s) · ${metrics.bugs_producao.atual} em produção`,
+        narr?.maior_risco ? `⚠️ Maior risco: ${narr.maior_risco}` : '',
+        wikiUrl ? `🔗 [Relatório completo na wiki](${wikiUrl})` : '',
+      ].filter(Boolean).join('\n\n');
+      try { await publishTeams(resumo); console.error('Resumo postado no Teams.'); }
+      catch (e) { console.error(`(falha ao postar no Teams: ${e.message})`); }
+    }
   }
   console.log(L.join('\n'));
 }
