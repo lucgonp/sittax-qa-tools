@@ -27,12 +27,14 @@ const proj = encodeURIComponent(PROJECT);
 
 // ---------- args ----------
 const argv = process.argv.slice(2);
-const flags = { model: 'claude-sonnet-4-6', claude: true, weekStart: null };
+const flags = { model: 'claude-sonnet-4-6', claude: true, weekStart: null, copyTo: '/mnt/c/Users/New User/Desktop' };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--model') flags.model = argv[++i];
   else if (a === '--no-claude') flags.claude = false;
   else if (a === '--week-start') flags.weekStart = argv[++i];
+  else if (a === '--copy-to') flags.copyTo = argv[++i]; // pasta extra p/ copiar o .md (ex.: Area de Trabalho)
+  else if (a === '--no-copy') flags.copyTo = '';
 }
 
 // ---------- janela de datas (segunda 00:00 UTC a segunda seguinte) ----------
@@ -327,6 +329,14 @@ RESPONDA APENAS com JSON valido:
   fs.writeFileSync(path.join(dir, `${stem}.md`), L.join('\n'), 'utf8');
   fs.writeFileSync(path.join(dir, `${stem}.json`), JSON.stringify({ metrics, narr }, null, 2), 'utf8');
   console.error(`\nRelatorio salvo em reports/${stem}.md`);
+  // copia o .md para uma pasta Windows (Area de Trabalho por padrao) — arquivo clicavel, sem caminho \\wsl
+  if (flags.copyTo) {
+    try {
+      fs.mkdirSync(flags.copyTo, { recursive: true });
+      fs.copyFileSync(path.join(dir, `${stem}.md`), path.join(flags.copyTo, `${stem}.md`));
+      console.error(`Copia na Area de Trabalho: ${flags.copyTo}/${stem}.md`);
+    } catch (e) { console.error(`(nao consegui copiar para ${flags.copyTo}: ${e.message})`); }
+  }
   console.log(L.join('\n'));
 }
 
