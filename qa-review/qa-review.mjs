@@ -541,22 +541,28 @@ for (const id of targets) {
     const rep = extractJson(raw);
     fs.writeFileSync(path.join(dir, `wi-${id}.json`), JSON.stringify({ wi: { id: wi.id, title: wi.title }, rep }, null, 2), 'utf8');
 
-    // Regra (sua): tem teste, mas NAO cobre a mudanca, e a atividade exige teste real (nao-SPA) -> reprova.
-    // SPA segue isento (cai no roteiro/aviso). Reprovacao por qualidade so com veredito claro do modelo.
-    // Trava: se a mudanca e SO integracao externa (Claude julgou pelo diff), nao reprova.
-    const testeNaoCobre = rep.qualidade_do_teste?.cobre_criterio === false;
+    // Tem teste, mas NAO cobre a mudanca, em codigo testavel (nao-SPA, nao-externo).
+    // JUSTO: so reprova quando a lacuna e ALTA (teste claramente nao protege contra o bug).
+    // Lacuna media/baixa -> NAO reprova; cai no roteiro com o aviso de qualidade, p/ QA
+    // validar na mao (evita atritar em casos dificeis de testar, ex.: concorrencia).
+    const qtv = rep.qualidade_do_teste;
+    const testeNaoCobre = qtv?.cobre_criterio === false;
+    const lacunaAlta = qtv?.severidade === 'alta';
     const isentoExterno = rep.comunicacao_externa?.isento === true;
     if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
     if (autoRejAtivo && exigeTesteReal && testeNaoCobre && !isentoExterno) {
-      if (!flags.comment) {
-        log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre a mudanca), nada postado/movido.');
-        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
+      if (lacunaAlta) {
+        if (!flags.comment) {
+          log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre — severidade alta), nada postado/movido.');
+          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
+          continue;
+        }
+        await autoReject(wi, prs, { motivo: 'cobertura', qt: qtv });
+        log('  ❌ teste nao cobre a mudanca (severidade ALTA) — reprovada e movida para Rejected');
+        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', ok: true });
         continue;
       }
-      await autoReject(wi, prs, { motivo: 'cobertura', qt: rep.qualidade_do_teste });
-      log(`  ❌ teste nao cobre a mudanca — reprovada e movida para Rejected`);
-      summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', ok: true });
-      continue;
+      log(`  ⚠️ teste nao cobre a mudanca (severidade ${qtv?.severidade || '?'}) — AVISO no roteiro, sem reprovar (caso limitrofe)`);
     }
 
     if (flags.comment) {
