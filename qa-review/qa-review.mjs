@@ -126,6 +126,11 @@ const NO_TEST_NEEDED = [
   /\/Consumers\/ConsultarUltimaDeclaracaoPeloSerproConsumer\.cs$/i,
 ];
 const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
+// Heuristica de integracao com sistema EXTERNO (fila/HTTP/API de terceiro) — nao comporta
+// teste unitario. Pega os casos obvios por nome/pasta sem gastar IA. Extensivel.
+const EXTERNAL_INTEGRATION = /(Consumer|Producer|Publisher|HttpClient|ApiClient|RestClient|Gateway|Webhook)\.cs$|IntegraContador\w*\.cs$|\/(Serpro|Ecac)\//i;
+// arquivo que nao exige teste: nao-testavel explicito OU integracao externa
+const naoExigeTeste = (p) => isNoTestNeeded(p) || EXTERNAL_INTEGRATION.test(p);
 // repositorios cujos arquivos nao comportam teste unitario (E2E/UI) — isentos, igual a NO_TEST_NEEDED
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
@@ -261,6 +266,7 @@ REGRAS:
 2. Derive os cenarios do DIFF: o que exatamente mudou de comportamento? Teste o caso corrigido E os casos vizinhos que podem ter regredido.
 3. "precisa_validacao_manual": false somente se a mudanca for totalmente coberta por teste automatizado confiavel E sem efeito visual/fluxo (raro). Em geral bugs de calculo/exibicao precisam validacao manual.
 4. "teste_automatizado": diga se o PR ja inclui teste (fato informado acima), se DEVERIA incluir e o que exatamente deveria ser coberto (classe/cenario). Para mudanca de frontend visual, teste automatizado pode ser dispensavel — justifique.
+4a. "comunicacao_externa": marque "isento": true SOMENTE se a mudanca for EXCLUSIVAMENTE encanamento de integracao com sistema EXTERNO (consumer/producer de fila, cliente HTTP/REST de terceiro, chamada a API externa como SERPRO, Ecac/Receita, gateway de pagamento) — codigo de I/O de fronteira que nao comporta teste unitario significativo. Se a mudanca tiver QUALQUER logica de negocio testavel (calculo, regra, transformacao, decisao) junto, "isento": false — essa parte exige teste. Na duvida, false.
 4b. "qualidade_do_teste" (so quando o PR inclui teste): com o CONTEUDO dos testes em maos, avalie se eles realmente COBREM o cenario corrigido e os criterios de aceite — nao basta existir. Marque "cobre_criterio": false e severidade quando o teste for fraco (ex.: assert trivial tipo Assert.True(true); testa um caminho diferente do bug; sem assert no valor que mudou; mocka justamente a parte corrigida; nao cobre o cenario dos criterios de aceite). Isto e um AVISO para o QA olhar de perto, NAO uma reprovacao. Se nao houver teste no PR, retorne "qualidade_do_teste": null.
 5. Se a descricao da atividade estiver vazia, infira o contexto pelo titulo e pelo codigo, e diga no campo "observacoes" que a atividade esta sem descricao/criterios de aceite (isso e um problema de processo).
 6. Senha/login, URLs internas e dados reais voce NAO conhece — escreva os passos de forma parametrizada ("acesse o painel como escritorio X com configuracao Y").
@@ -280,6 +286,10 @@ RESPONDA APENAS com JSON valido:
     "necessario": true|false,
     "justificativa": "...",
     "sugestao": "o que cobrir e onde (ex.: teste unitario em X cobrindo cenario Y), ou null"
+  },
+  "comunicacao_externa": {
+    "isento": true|false,
+    "motivo": "1 frase: por que e (ou nao e) so integracao externa sem logica testavel"
   },
   "qualidade_do_teste": {
     "cobre_criterio": true|false,
@@ -474,7 +484,7 @@ for (const id of targets) {
     if (autoRejAtivo) {
       // cada arquivo carrega se o PR dele e de um repo isento (ex.: Sittax.Ui.Test = E2E)
       const arquivos = prs.flatMap((p) => p.files.map((f) => ({ path: f.path, isento: p.noTestRepo })));
-      const exigemTeste = arquivos.filter((a) => !a.isento && !SPA_PATH.test(a.path) && !isNoTestNeeded(a.path));
+      const exigemTeste = arquivos.filter((a) => !a.isento && !SPA_PATH.test(a.path) && !naoExigeTeste(a.path));
       const temSpa = arquivos.some((a) => !a.isento && SPA_PATH.test(a.path));
       exigeTesteReal = exigemTeste.length > 0;
       const semTeste = prs.every((p) => !p.testFiles.length);
@@ -508,8 +518,11 @@ for (const id of targets) {
 
     // Regra (sua): tem teste, mas NAO cobre a mudanca, e a atividade exige teste real (nao-SPA) -> reprova.
     // SPA segue isento (cai no roteiro/aviso). Reprovacao por qualidade so com veredito claro do modelo.
+    // Trava: se a mudanca e SO integracao externa (Claude julgou pelo diff), nao reprova.
     const testeNaoCobre = rep.qualidade_do_teste?.cobre_criterio === false;
-    if (autoRejAtivo && exigeTesteReal && testeNaoCobre) {
+    const isentoExterno = rep.comunicacao_externa?.isento === true;
+    if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
+    if (autoRejAtivo && exigeTesteReal && testeNaoCobre && !isentoExterno) {
       if (!flags.comment) {
         log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre a mudanca), nada postado/movido.');
         summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
