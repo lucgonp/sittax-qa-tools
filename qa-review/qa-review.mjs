@@ -95,11 +95,12 @@ const stripHtml = (h) => String(h || '')
 async function getWorkItem(id) {
   const w = await ado(`${ORG}/${proj}/_apis/wit/workitems/${id}?$expand=relations&api-version=7.1`);
   const f = w.fields;
+  // vstfs:///Git/PullRequestId/<projetoGuid>/<repoGuid>/<prId> — o PR pode estar em
+  // OUTRO projeto/repo do org (ex.: ST, NFe), nao so no projeto Sittax.
   const prRefs = (w.relations || [])
     .map((r) => decodeURIComponent(r.url || ''))
     .filter((u) => u.includes('vstfs:///Git/PullRequestId/'))
-    .map((u) => { const p = u.split('/'); return { repoId: p[p.length - 1].split('%2F')[1] ?? p[p.length - 2], raw: u }; })
-    .map((x) => { const m = x.raw.match(/PullRequestId\/(.+)$/); const parts = decodeURIComponent(m[1]).split('/'); return { repoId: parts[1], prId: parts[2] }; });
+    .map((u) => { const m = u.match(/PullRequestId\/(.+)$/); const parts = m[1].split('/'); return { projectId: parts[0], repoId: parts[1], prId: parts[2] }; });
   return {
     id,
     type: f['System.WorkItemType'],
@@ -160,8 +161,9 @@ async function unifiedDiff(baseTxt, headTxt) {
   }
 }
 
-async function getPrContext(repoId, prId) {
-  const base = `${ORG}/${proj}/_apis/git/repositories/${repoId}`;
+async function getPrContext(repoId, prId, projectId) {
+  // usa o projeto do proprio vinculo (PR pode estar em outro projeto do org); fallback: Sittax
+  const base = `${ORG}/${encodeURIComponent(projectId || PROJECT)}/_apis/git/repositories/${repoId}`;
   const pr = await ado(`${base}/pullRequests/${prId}?api-version=7.1`);
   const branch = pr.sourceRefName.replace('refs/heads/', '');
   const targetBranch = pr.targetRefName.replace('refs/heads/', '');
@@ -206,7 +208,7 @@ async function getPrContext(repoId, prId) {
     title: pr.title, description: pr.description || '', branch,
     status: pr.status, author: pr.createdBy?.displayName,
     files, testFiles, excerpts, testExcerpts,
-    url: `${ORG}/${proj}/_git/${pr.repository?.name || repoId}/pullrequest/${prId}`,
+    url: `${ORG}/${encodeURIComponent(pr.repository?.project?.name || PROJECT)}/_git/${encodeURIComponent(pr.repository?.name || repoId)}/pullrequest/${prId}`,
   };
 }
 
@@ -467,7 +469,7 @@ for (const id of targets) {
     for (const ref of wi.prRefs) {
       log(`  baixando PR #${ref.prId}...`);
       try {
-        prs.push(await getPrContext(ref.repoId, ref.prId));
+        prs.push(await getPrContext(ref.repoId, ref.prId, ref.projectId));
       } catch (e) {
         // repo deletado/movido (404) ou sem acesso — pula esse PR e segue com os demais
         prsInacessiveis++;
@@ -492,7 +494,8 @@ for (const id of targets) {
     if (autoRejAtivo) {
       // cada arquivo carrega se o PR dele e de um repo isento (ex.: Sittax.Ui.Test = E2E)
       const arquivos = prs.flatMap((p) => p.files.map((f) => ({ path: f.path, isento: p.noTestRepo })));
-      const exigemTeste = arquivos.filter((a) => !a.isento && !SPA_PATH.test(a.path) && !naoExigeTeste(a.path));
+      // so ARQUIVO DE CODIGO conta; config/IDE/doc (.idea, .gitignore, .xml, .md...) nao exige teste
+      const exigemTeste = arquivos.filter((a) => CODE_EXT.test(a.path) && !a.isento && !SPA_PATH.test(a.path) && !naoExigeTeste(a.path));
       const temSpa = arquivos.some((a) => !a.isento && SPA_PATH.test(a.path));
       exigeTesteReal = exigemTeste.length > 0;
       const semTeste = prs.every((p) => !p.testFiles.length);
