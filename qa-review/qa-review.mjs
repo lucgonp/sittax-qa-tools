@@ -122,6 +122,8 @@ const SPA_PATH = /^\/Sittax\.Spa\//i;
 // arquivos que NAO comportam teste unitario (integracao externa / envio) — nem avisa nem reprova, so gera roteiro
 const NO_TEST_NEEDED = [
   /\/Sittax\.Domain\/Serpro\/Services\/IntegraContadorServicesBase\.cs$/i,
+  /\/Sittax\.Domain\/Serpro\/Services\/ConsultarFaturamentoIntegraContadorServices\.cs$/i,
+  /\/Consumers\/ConsultarUltimaDeclaracaoPeloSerproConsumer\.cs$/i,
 ];
 const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
 // repositorios cujos arquivos nao comportam teste unitario (E2E/UI) — isentos, igual a NO_TEST_NEEDED
