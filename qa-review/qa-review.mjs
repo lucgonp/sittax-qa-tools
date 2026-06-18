@@ -117,7 +117,9 @@ async function getWorkItem(id) {
 }
 
 const CODE_EXT = /\.(cs|ts|html|scss|css|js|sql|py)$/i;
-const TEST_PATH = /\/src\/Tests\/|\.spec\.|Test\.cs$|\.test\./i;
+// reconhece teste por varias convencoes: /src/Tests/, pasta *.Test(s)/, sufixo Test(s).cs
+// (singular E plural — o projeto ST usa *Tests.cs), Spec(s).cs, e .spec./.test. do front
+const TEST_PATH = /\/src\/Tests\/|\/[^/]*\.Tests?\/|Tests?\.cs$|Specs?\.cs$|\.spec\.|\.test\./i;
 // mudancas SO nessa pasta (frontend) nao sao reprovadas por falta de teste — apenas aviso
 const SPA_PATH = /^\/Sittax\.Spa\//i;
 // arquivos que NAO comportam teste unitario (integracao externa / envio) — nem avisa nem reprova, so gera roteiro
@@ -138,8 +140,10 @@ const EXTERNAL_INTEGRATION = [
   /\/Serpro\/(Services|Models|Interfaces)\//i,   // chamadas/DTOs/contratos da API SERPRO
 ];
 const isExternal = (p) => EXTERNAL_INTEGRATION.some((re) => re.test(p));
-// arquivo que nao exige teste: nao-testavel explicito OU integracao externa
-const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p);
+// codigo GERADO automaticamente (migrations EF, snapshots, designer) — nao se escreve teste unitario
+const GENERATED = /\/Migrations\/[^/]+\.cs$|\.Designer\.cs$|ModelSnapshot\.cs$/i;
+// arquivo que nao exige teste: nao-testavel explicito OU integracao externa OU codigo gerado
+const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p) || GENERATED.test(p);
 // repositorios cujos arquivos nao comportam teste unitario (E2E/UI) — isentos, igual a NO_TEST_NEEDED
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
@@ -369,7 +373,7 @@ async function postComment(wiId, html) {
 
 // reprovacao por falta de teste: zero tokens de IA — deteccao por codigo + comentario + estado Rejected
 // motivo: 'ausencia' (PR sem teste) ou 'cobertura' (tem teste, mas nao cobre a mudanca)
-async function autoReject(wi, prs, { motivo = 'ausencia', qt = null } = {}) {
+async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = [] } = {}) {
   // nao duplica comentario quando o dev devolve pra Review sem corrigir
   const prev = await ado(`${ORG}/${proj}/_apis/wit/workItems/${wi.id}/comments?api-version=7.1-preview.3`);
   const jaReprovada = (prev.comments || []).some((c) => (c.text || '').includes('REPROVADO —'));
@@ -378,17 +382,27 @@ async function autoReject(wi, prs, { motivo = 'ausencia', qt = null } = {}) {
     await moveToRejected(wi);
     return;
   }
+  const prLinks = prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ');
+  // lista os arquivos que exigem cobertura (cap 6) — torna o comentario acionavel
+  const listaArquivos = () => {
+    if (!arquivos.length) return '';
+    const top = arquivos.slice(0, 6).map((p) => `<li><code>${esc(p)}</code></li>`).join('');
+    const resto = arquivos.length > 6 ? `<li>… e mais ${arquivos.length - 6} arquivo(s)</li>` : '';
+    return `<p><b>Arquivos que precisam de teste:</b></p><ul>${top}${resto}</ul>`;
+  };
   const H = [];
   if (motivo === 'cobertura') {
-    H.push('<p><b>❌ REPROVADO — teste não cobre a mudança</b></p>');
-    H.push(`<p>O(s) PR(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) incluem teste, mas ele <b>não exercita a correção</b>${qt?.severidade ? ` (severidade ${esc(qt.severidade)})` : ''}.</p>`);
-    if (qt?.analise) H.push(`<p>${esc(qt.analise)}</p>`);
-    H.push('<p>Ajuste o teste para cobrir de fato o comportamento corrigido e devolva a atividade para Review — a validação será refeita automaticamente.</p>');
+    H.push('<p><b>❌ REPROVADO — o teste não cobre a mudança</b></p>');
+    H.push(`<p>O(s) PR(s) ${prLinks} incluem teste, mas ele <b>não exercita a correção</b>${qt?.severidade ? ` (severidade <b>${esc(qt.severidade)}</b>)` : ''}.</p>`);
+    if (qt?.analise) H.push(`<p><b>O que ficou descoberto:</b> ${esc(qt.analise)}</p>`);
+    H.push('<p>➡️ Ajuste o teste para exercitar de fato o comportamento corrigido e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
   } else {
     H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
-    H.push(`<p>O(s) PR(s) vinculado(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) não alteram nenhum arquivo de teste (<code>/src/Tests/</code>, <code>.spec.ts</code>, <code>*Test.cs</code>).</p>`);
-    H.push('<p>Inclua teste automatizado cobrindo a mudança e devolva a atividade para Review — a validação de QA será refeita automaticamente.</p>');
+    H.push(`<p>O(s) PR(s) ${prLinks} alteram código que exige cobertura, mas <b>não incluem nenhum teste</b> (<code>/src/Tests/</code>, <code>*Test.cs</code>, <code>.spec.ts</code>).</p>`);
+    H.push(listaArquivos());
+    H.push('<p>➡️ Inclua teste automatizado cobrindo o comportamento alterado e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
   }
+  H.push('<p><i>Isento de teste: mudança só em frontend (<code>Sittax.Spa</code>) ou em integração com sistema externo (consumer de fila, cliente HTTP, API de terceiro).</i></p>');
   H.push('<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>');
   await postComment(wi.id, H.join(''));
   await moveToRejected(wi);
@@ -514,7 +528,7 @@ for (const id of targets) {
             summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
             continue;
           }
-          await autoReject(wi, prs, { motivo: 'ausencia' });
+          await autoReject(wi, prs, { motivo: 'ausencia', arquivos: [...new Set(exigemTeste.map((a) => a.path))] });
           log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
           summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
           continue;
