@@ -127,10 +127,18 @@ const NO_TEST_NEEDED = [
 ];
 const isNoTestNeeded = (p) => NO_TEST_NEEDED.some((re) => re.test(p));
 // Heuristica de integracao com sistema EXTERNO (fila/HTTP/API de terceiro) — nao comporta
-// teste unitario. Pega os casos obvios por nome/pasta sem gastar IA. Extensivel.
-const EXTERNAL_INTEGRATION = /(Consumer|Producer|Publisher|HttpClient|ApiClient|RestClient|Gateway|Webhook)\.cs$|IntegraContador\w*\.cs$|\/(Serpro|Ecac)\//i;
+// teste unitario. Ancorada na camada de TRANSPORTE/consumer/DTO, NAO no dominio Serpro/Ecac
+// inteiro: Services de orquestracao, Controllers e parsers (ex.: InterpretadorPdf) continuam
+// exigindo teste. O julgamento do Claude (comunicacao_externa) pega o que escapar do nome.
+const EXTERNAL_INTEGRATION = [
+  /(Consumer|Producer|Publisher|HttpClient|ApiClient|RestClient|Gateway|Webhook)\.cs$/i, // transporte/fila por nome
+  /IntegraContador\w*\.cs$/i,                   // integracao SERPRO IntegraContador
+  /ConectarEcac\w*\.cs$/i,                       // clientes de conexao Ecac
+  /\/Serpro\/(Services|Models|Interfaces)\//i,   // chamadas/DTOs/contratos da API SERPRO
+];
+const isExternal = (p) => EXTERNAL_INTEGRATION.some((re) => re.test(p));
 // arquivo que nao exige teste: nao-testavel explicito OU integracao externa
-const naoExigeTeste = (p) => isNoTestNeeded(p) || EXTERNAL_INTEGRATION.test(p);
+const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p);
 // repositorios cujos arquivos nao comportam teste unitario (E2E/UI) — isentos, igual a NO_TEST_NEEDED
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
