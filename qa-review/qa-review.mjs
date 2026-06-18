@@ -148,6 +148,35 @@ const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p) || GENERATED.tes
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
 
+// O dev pode ter teste que JA EXISTE no repo (nao vem no PR de refactor/ajuste). Antes de
+// reprovar por ausencia, procura no code search do ADO um arquivo de TESTE que cite a(s)
+// classe(s) alterada(s). Se existe -> a area e coberta -> nao reprova.
+async function repoTemTesteParaClasses(baseNames) {
+  // tira o prefixo I de interfaces (INcmRepository -> NcmRepository tem o mesmo teste)
+  const nomes = [...new Set(baseNames.filter(Boolean).map((n) => n.replace(/^I(?=[A-Z])/, '')))].slice(0, 6);
+  const t = await token().catch(() => null);
+  if (!t || !nomes.length) return false;
+  // busca CLASSE POR CLASSE (multi-termo no code search vira AND e nao casa) — para no 1o hit
+  for (const nome of nomes) {
+    try {
+      const res = await fetch('https://almsearch.dev.azure.com/Sittax/_apis/search/codesearchresults?api-version=7.1-preview.1', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ searchText: nome, $top: 25 }),
+      });
+      if (!res.ok) continue;
+      const d = await res.json();
+      const achou = (d.results || []).some((r) => {
+        const p = r.path || '';
+        return TEST_PATH.test(p) && p.toLowerCase().includes(nome.toLowerCase());
+      });
+      if (achou) { log(`  (teste no repo encontrado p/ ${nome})`); return true; }
+    } catch { /* ignora e segue */ }
+  }
+  return false;
+}
+const classeDoArquivo = (p) => (p.split('/').pop() || '').replace(/\.cs$/i, '');
+
 async function fileAtBranch(base, filePath, version, versionType = 'branch') {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(version)}&versionDescriptor.versionType=${versionType}&api-version=7.1&$format=text`, { asText: true });
 }
@@ -547,21 +576,26 @@ for (const id of targets) {
     const precisaTeste = rep.teste_automatizado?.necessario === true; // refatoracao/coberto/dispensavel -> false
     if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
 
-    // AUSENCIA (PR sem teste): so reprova se o Claude confirmar que PRECISA de teste novo.
-    // Refatoracao coberta por teste existente -> necessario=false -> NAO reprova (roteiro normal).
+    // AUSENCIA (PR sem teste): so reprova se (a) o Claude confirma que PRECISA de teste novo
+    // E (b) NAO existe teste no repo p/ a classe alterada (o dev pode provar que ja existe).
     if (autoRejAtivo && pendenteAusencia && !isentoExterno) {
-      if (precisaTeste) {
-        if (!flags.comment) {
-          log('  DRY-RUN (--no-comment): seria reprovada (sem teste, e o Claude confirma que precisa), nada postado/movido.');
+      if (!precisaTeste) {
+        log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao / coberto / dispensavel) — roteiro normal, sem reprovar');
+      } else {
+        const cobertoNoRepo = await repoTemTesteParaClasses(arquivosExigem.map(classeDoArquivo));
+        if (cobertoNoRepo) {
+          log('  ✅ sem teste no PR, mas EXISTE teste no repo p/ a(s) classe(s) alterada(s) — area coberta, sem reprovar');
+        } else if (!flags.comment) {
+          log('  DRY-RUN (--no-comment): seria reprovada (sem teste no PR e sem teste no repo p/ a classe), nada postado/movido.');
           summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
           continue;
+        } else {
+          await autoReject(wi, prs, { motivo: 'ausencia', arquivos: arquivosExigem });
+          log('  ❌ sem teste no PR nem no repo p/ a classe — reprovada e movida para Rejected');
+          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
+          continue;
         }
-        await autoReject(wi, prs, { motivo: 'ausencia', arquivos: arquivosExigem });
-        log('  ❌ sem teste e o Claude confirma que precisa (comportamento novo/alterado) — reprovada e movida para Rejected');
-        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
-        continue;
       }
-      log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao / coberto / dispensavel) — roteiro normal, sem reprovar');
     }
 
     // COBERTURA (tem teste, mas NAO cobre): so reprova com lacuna ALTA E teste realmente necessario.
