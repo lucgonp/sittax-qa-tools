@@ -279,7 +279,11 @@ REGRAS:
 1. Os passos devem ser executaveis por um QA no ambiente de homologacao: onde clicar/navegar, que dados usar (cite cenarios concretos a partir do codigo: ex. se a correcao trata grupo economico, o passo deve dizer "use um escritorio FILHO de um grupo economico com configuracao propria de DIFAL diferente da do pai").
 2. Derive os cenarios do DIFF: o que exatamente mudou de comportamento? Teste o caso corrigido E os casos vizinhos que podem ter regredido.
 3. "precisa_validacao_manual": false somente se a mudanca for totalmente coberta por teste automatizado confiavel E sem efeito visual/fluxo (raro). Em geral bugs de calculo/exibicao precisam validacao manual.
-4. "teste_automatizado": diga se o PR ja inclui teste (fato informado acima), se DEVERIA incluir e o que exatamente deveria ser coberto (classe/cenario). Para mudanca de frontend visual, teste automatizado pode ser dispensavel — justifique.
+4. "teste_automatizado": diga se o PR ja inclui teste (fato informado acima), se DEVERIA incluir ("necessario") e o que cobrir. CRITICO p/ "necessario":
+   - REFATORACAO (comportamento preservado: renomear, extrair metodo, mover codigo, trocar implementacao sem mudar saida): "necessario": FALSE. O PR nao precisa adicionar teste novo — os testes que JA EXISTIAM continuam validando o comportamento. NAO exija teste so porque o PR nao inclui teste; um refactor coberto por teste existente esta coberto. So marque "necessario": true se o refactor MUDOU comportamento observavel que nao esta testado.
+   - Comportamento NOVO ou bug corrigido (muda saida/regra/calculo) sem teste que o exercite: "necessario": true.
+   - Frontend visual, config, codigo gerado, integracao externa: "necessario": false (justifique).
+   Na duvida entre refactor e mudanca de comportamento, olhe se o diff altera valores/decisoes de saida.
 4a. "comunicacao_externa": marque "isento": true SOMENTE se a mudanca for EXCLUSIVAMENTE encanamento de integracao com sistema EXTERNO (consumer/producer de fila, cliente HTTP/REST de terceiro, chamada a API externa como SERPRO, Ecac/Receita, gateway de pagamento) — codigo de I/O de fronteira que nao comporta teste unitario significativo. Se a mudanca tiver QUALQUER logica de negocio testavel (calculo, regra, transformacao, decisao) junto, "isento": false — essa parte exige teste. Na duvida, false.
 4b. "qualidade_do_teste" (so quando o PR inclui teste): com o CONTEUDO dos testes em maos, avalie se eles realmente COBREM o cenario corrigido e os criterios de aceite — nao basta existir. Marque "cobre_criterio": false e severidade quando o teste for fraco (ex.: assert trivial tipo Assert.True(true); testa um caminho diferente do bug; sem assert no valor que mudou; mocka justamente a parte corrigida; nao cobre o cenario dos criterios de aceite). Isto e um AVISO para o QA olhar de perto, NAO uma reprovacao. Se nao houver teste no PR, retorne "qualidade_do_teste": null.
 5. Se a descricao da atividade estiver vazia, infira o contexto pelo titulo e pelo codigo, e diga no campo "observacoes" que a atividade esta sem descricao/criterios de aceite (isso e um problema de processo).
@@ -501,6 +505,8 @@ for (const id of targets) {
     // que cobre a mudanca, reprova. Calculamos uma vez se a atividade EXIGE teste real.
     const autoRejAtivo = flags.autoReject && !prsInacessiveis && prs.length;
     let exigeTesteReal = false; // ha arquivo nao-isento, fora de SPA e fora da lista de nao-testaveis
+    let pendenteAusencia = false; // PR sem teste em codigo testavel -> decisao final depende do Claude (refactor?)
+    let arquivosExigem = [];      // arquivos de codigo que motivariam a reprovacao por ausencia
     if (flags.autoReject && prsInacessiveis) {
       // nao reprovar se algum PR ficou inacessivel — o teste pode estar no PR que nao conseguimos ler
       log('  AVISO: ha PR(s) inacessivel(is) — auto-reject desativado para esta atividade (nao da pra afirmar que falta teste).');
@@ -522,16 +528,12 @@ for (const id of targets) {
           avisoSpaSemTeste = true;
           log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
         } else {
-          log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).map((a) => a.path).join(', ')}`);
-          if (!flags.comment) {
-            log('  DRY-RUN (--no-comment): seria reprovada (ausencia de teste), nada postado/movido.');
-            summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
-            continue;
-          }
-          await autoReject(wi, prs, { motivo: 'ausencia', arquivos: [...new Set(exigemTeste.map((a) => a.path))] });
-          log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
-          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
-          continue;
+          // PR sem teste em codigo testavel: NAO reprova de imediato. Deixa o Claude julgar se
+          // PRECISA de teste novo — refatoracao coberta por teste existente NAO precisa (o dev
+          // mexe no codigo sem tocar nos testes, e os que ja existem seguem validando).
+          pendenteAusencia = true;
+          arquivosExigem = [...new Set(exigemTeste.map((a) => a.path))];
+          log(`  sem teste no PR (${arquivosExigem.slice(0, 4).join(', ')}) — verificando com IA se precisa de teste novo ou e refatoracao coberta`);
         }
       }
     }
@@ -541,17 +543,34 @@ for (const id of targets) {
     const rep = extractJson(raw);
     fs.writeFileSync(path.join(dir, `wi-${id}.json`), JSON.stringify({ wi: { id: wi.id, title: wi.title }, rep }, null, 2), 'utf8');
 
-    // Tem teste, mas NAO cobre a mudanca, em codigo testavel (nao-SPA, nao-externo).
-    // JUSTO: so reprova quando a lacuna e ALTA (teste claramente nao protege contra o bug).
-    // Lacuna media/baixa -> NAO reprova; cai no roteiro com o aviso de qualidade, p/ QA
-    // validar na mao (evita atritar em casos dificeis de testar, ex.: concorrencia).
+    const isentoExterno = rep.comunicacao_externa?.isento === true;
+    const precisaTeste = rep.teste_automatizado?.necessario === true; // refatoracao/coberto/dispensavel -> false
+    if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
+
+    // AUSENCIA (PR sem teste): so reprova se o Claude confirmar que PRECISA de teste novo.
+    // Refatoracao coberta por teste existente -> necessario=false -> NAO reprova (roteiro normal).
+    if (autoRejAtivo && pendenteAusencia && !isentoExterno) {
+      if (precisaTeste) {
+        if (!flags.comment) {
+          log('  DRY-RUN (--no-comment): seria reprovada (sem teste, e o Claude confirma que precisa), nada postado/movido.');
+          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
+          continue;
+        }
+        await autoReject(wi, prs, { motivo: 'ausencia', arquivos: arquivosExigem });
+        log('  ❌ sem teste e o Claude confirma que precisa (comportamento novo/alterado) — reprovada e movida para Rejected');
+        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
+        continue;
+      }
+      log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao / coberto / dispensavel) — roteiro normal, sem reprovar');
+    }
+
+    // COBERTURA (tem teste, mas NAO cobre): so reprova com lacuna ALTA E teste realmente necessario.
+    // Lacuna media/baixa -> AVISO no roteiro p/ QA validar na mao (ex.: concorrencia).
     const qtv = rep.qualidade_do_teste;
     const testeNaoCobre = qtv?.cobre_criterio === false;
     const lacunaAlta = qtv?.severidade === 'alta';
-    const isentoExterno = rep.comunicacao_externa?.isento === true;
-    if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
-    if (autoRejAtivo && exigeTesteReal && testeNaoCobre && !isentoExterno) {
-      if (lacunaAlta) {
+    if (autoRejAtivo && exigeTesteReal && !pendenteAusencia && testeNaoCobre && !isentoExterno) {
+      if (lacunaAlta && precisaTeste) {
         if (!flags.comment) {
           log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre — severidade alta), nada postado/movido.');
           summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
@@ -562,7 +581,7 @@ for (const id of targets) {
         summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', ok: true });
         continue;
       }
-      log(`  ⚠️ teste nao cobre a mudanca (severidade ${qtv?.severidade || '?'}) — AVISO no roteiro, sem reprovar (caso limitrofe)`);
+      log(`  ⚠️ teste nao cobre a mudanca (severidade ${qtv?.severidade || '?'}) — AVISO no roteiro, sem reprovar`);
     }
 
     if (flags.comment) {
