@@ -346,19 +346,27 @@ async function postComment(wiId, html) {
 }
 
 // reprovacao por falta de teste: zero tokens de IA — deteccao por codigo + comentario + estado Rejected
-async function autoReject(wi, prs) {
-  // nao duplica comentario quando o dev devolve pra Review sem incluir teste
+// motivo: 'ausencia' (PR sem teste) ou 'cobertura' (tem teste, mas nao cobre a mudanca)
+async function autoReject(wi, prs, { motivo = 'ausencia', qt = null } = {}) {
+  // nao duplica comentario quando o dev devolve pra Review sem corrigir
   const prev = await ado(`${ORG}/${proj}/_apis/wit/workItems/${wi.id}/comments?api-version=7.1-preview.3`);
-  const jaReprovada = (prev.comments || []).some((c) => (c.text || '').includes('REPROVADO — falta de teste'));
+  const jaReprovada = (prev.comments || []).some((c) => (c.text || '').includes('REPROVADO —'));
   if (jaReprovada) {
     log('  ja tem comentario de reprovacao — so movendo estado, sem novo comentario');
     await moveToRejected(wi);
     return;
   }
   const H = [];
-  H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
-  H.push(`<p>O(s) PR(s) vinculado(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) não alteram nenhum arquivo de teste (<code>/src/Tests/</code>, <code>.spec.ts</code>, <code>*Test.cs</code>).</p>`);
-  H.push('<p>Inclua teste automatizado cobrindo a mudança e devolva a atividade para Review — a validação de QA será refeita automaticamente.</p>');
+  if (motivo === 'cobertura') {
+    H.push('<p><b>❌ REPROVADO — teste não cobre a mudança</b></p>');
+    H.push(`<p>O(s) PR(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) incluem teste, mas ele <b>não exercita a correção</b>${qt?.severidade ? ` (severidade ${esc(qt.severidade)})` : ''}.</p>`);
+    if (qt?.analise) H.push(`<p>${esc(qt.analise)}</p>`);
+    H.push('<p>Ajuste o teste para cobrir de fato o comportamento corrigido e devolva a atividade para Review — a validação será refeita automaticamente.</p>');
+  } else {
+    H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
+    H.push(`<p>O(s) PR(s) vinculado(s) (${prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ')}) não alteram nenhum arquivo de teste (<code>/src/Tests/</code>, <code>.spec.ts</code>, <code>*Test.cs</code>).</p>`);
+    H.push('<p>Inclua teste automatizado cobrindo a mudança e devolva a atividade para Review — a validação de QA será refeita automaticamente.</p>');
+  }
   H.push('<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>');
   await postComment(wi.id, H.join(''));
   await moveToRejected(wi);
@@ -453,35 +461,41 @@ for (const id of targets) {
     }
     if (!prs.length) log('  AVISO: sem PR vinculado — analise so pelo work item.');
     let avisoSpaSemTeste = false;
-    // nao reprovar se algum PR ficou inacessivel — o teste pode estar no PR que nao conseguimos ler
+    // Regra de reprovacao (a sua): SO mudanca em SPA e isenta; o resto, se nao tem teste
+    // que cobre a mudanca, reprova. Calculamos uma vez se a atividade EXIGE teste real.
+    const autoRejAtivo = flags.autoReject && !prsInacessiveis && prs.length;
+    let exigeTesteReal = false; // ha arquivo nao-isento, fora de SPA e fora da lista de nao-testaveis
     if (flags.autoReject && prsInacessiveis) {
+      // nao reprovar se algum PR ficou inacessivel — o teste pode estar no PR que nao conseguimos ler
       log('  AVISO: ha PR(s) inacessivel(is) — auto-reject desativado para esta atividade (nao da pra afirmar que falta teste).');
     }
-    if (flags.autoReject && !prsInacessiveis && prs.length && prs.every((p) => !p.testFiles.length)) {
+    if (autoRejAtivo) {
       // cada arquivo carrega se o PR dele e de um repo isento (ex.: Sittax.Ui.Test = E2E)
       const arquivos = prs.flatMap((p) => p.files.map((f) => ({ path: f.path, isento: p.noTestRepo })));
-      // arquivos que exigiriam teste: nao isentos por repo, fora de SPA e fora da lista de nao-testaveis
       const exigemTeste = arquivos.filter((a) => !a.isento && !SPA_PATH.test(a.path) && !isNoTestNeeded(a.path));
       const temSpa = arquivos.some((a) => !a.isento && SPA_PATH.test(a.path));
-      const soNaoTestaveis = arquivos.length > 0 && exigemTeste.length === 0 && !temSpa;
-      if (soNaoTestaveis) {
-        // ex.: IntegraContadorServicesBase.cs — envio da apuracao, sem teste unitario viavel; nem avisa nem reprova
-        log('  ℹ️ sem teste, mas mudanca SO em arquivo(s) que nao comporta(m) teste unitario — roteiro normal, sem aviso/reprovacao');
-      } else if (exigemTeste.length === 0) {
-        // sobrou so SPA (eventualmente + nao-testaveis) -> aviso, sem reprovacao
-        avisoSpaSemTeste = true;
-        log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
-      } else {
-        log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).map((a) => a.path).join(', ')}`);
-        if (!flags.comment) {
-          log('  DRY-RUN (--no-comment): seria reprovada, nada postado/movido.');
-          summary.push({ id, title: wi.title, rejeitada: true, dryRun: true, ok: true });
+      exigeTesteReal = exigemTeste.length > 0;
+      const semTeste = prs.every((p) => !p.testFiles.length);
+      if (semTeste) {
+        const soNaoTestaveis = arquivos.length > 0 && !exigeTesteReal && !temSpa;
+        if (soNaoTestaveis) {
+          log('  ℹ️ sem teste, mas mudanca SO em arquivo(s) que nao comporta(m) teste unitario — roteiro normal, sem aviso/reprovacao');
+        } else if (!exigeTesteReal) {
+          // sobrou so SPA (eventualmente + nao-testaveis) -> aviso, sem reprovacao
+          avisoSpaSemTeste = true;
+          log('  ⚠️ sem teste, mas mudanca SO em Sittax.Spa — warning no roteiro em vez de reprovacao');
+        } else {
+          log(`  arquivos que exigem teste: ${exigemTeste.slice(0, 5).map((a) => a.path).join(', ')}`);
+          if (!flags.comment) {
+            log('  DRY-RUN (--no-comment): seria reprovada (ausencia de teste), nada postado/movido.');
+            summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
+            continue;
+          }
+          await autoReject(wi, prs, { motivo: 'ausencia' });
+          log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
+          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
           continue;
         }
-        await autoReject(wi, prs);
-        log(`  ❌ sem teste no PR — reprovada e movida para Rejected (sem gastar IA)`);
-        summary.push({ id, title: wi.title, rejeitada: true, ok: true });
-        continue;
       }
     }
     const prompt = buildPrompt(wi, prs);
@@ -489,6 +503,22 @@ for (const id of targets) {
     const raw = await runClaude(prompt, flags.model);
     const rep = extractJson(raw);
     fs.writeFileSync(path.join(dir, `wi-${id}.json`), JSON.stringify({ wi: { id: wi.id, title: wi.title }, rep }, null, 2), 'utf8');
+
+    // Regra (sua): tem teste, mas NAO cobre a mudanca, e a atividade exige teste real (nao-SPA) -> reprova.
+    // SPA segue isento (cai no roteiro/aviso). Reprovacao por qualidade so com veredito claro do modelo.
+    const testeNaoCobre = rep.qualidade_do_teste?.cobre_criterio === false;
+    if (autoRejAtivo && exigeTesteReal && testeNaoCobre) {
+      if (!flags.comment) {
+        log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre a mudanca), nada postado/movido.');
+        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
+        continue;
+      }
+      await autoReject(wi, prs, { motivo: 'cobertura', qt: rep.qualidade_do_teste });
+      log(`  ❌ teste nao cobre a mudanca — reprovada e movida para Rejected`);
+      summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', ok: true });
+      continue;
+    }
+
     if (flags.comment) {
       await postComment(id, renderHtml(wi, prs, rep, avisoSpaSemTeste, prsInacessiveis));
       log(`  ✅ comentario postado: ${ORG}/${proj}/_workitems/edit/${id}`);
@@ -506,6 +536,6 @@ fs.writeFileSync(path.join(dir, 'summary.json'), JSON.stringify(summary, null, 2
 console.log('\n===== RESUMO =====');
 for (const s of summary) {
   if (!s.ok) { console.log(`#${s.id}: ERRO — ${s.erro}`); continue; }
-  if (s.rejeitada) { console.log(`#${s.id}: ❌ REPROVADA (sem teste no PR, sem gasto de IA) | ${s.title.slice(0, 70)}`); continue; }
+  if (s.rejeitada) { console.log(`#${s.id}: ❌ REPROVADA (${s.motivo === 'cobertura' ? 'teste não cobre a mudança' : 'sem teste no PR'}${s.dryRun ? ', dry-run' : ''}) | ${s.title.slice(0, 70)}`); continue; }
   console.log(`#${s.id}: ${s.passos} passos | manual: ${s.manual ? 'SIM' : 'nao'} | PR tem teste: ${s.temTeste ? 'sim' : 'NAO'}${s.testeFraco ? ' (⚠️ FRACO)' : ''} | teste necessario: ${s.precisaTeste ? 'SIM' : 'nao'} | ${s.title.slice(0, 70)}`);
 }
