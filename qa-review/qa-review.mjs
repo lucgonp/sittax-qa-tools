@@ -148,34 +148,6 @@ const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p) || GENERATED.tes
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
 
-// O dev pode ter teste que JA EXISTE no repo (nao vem no PR de refactor/ajuste). Antes de
-// reprovar por ausencia, procura no code search do ADO um arquivo de TESTE que cite a(s)
-// classe(s) alterada(s). Se existe -> a area e coberta -> nao reprova.
-async function repoTemTesteParaClasses(baseNames) {
-  // tira o prefixo I de interfaces (INcmRepository -> NcmRepository tem o mesmo teste)
-  const nomes = [...new Set(baseNames.filter(Boolean).map((n) => n.replace(/^I(?=[A-Z])/, '')))].slice(0, 6);
-  const t = await token().catch(() => null);
-  if (!t || !nomes.length) return false;
-  // busca CLASSE POR CLASSE (multi-termo no code search vira AND e nao casa) — para no 1o hit
-  for (const nome of nomes) {
-    try {
-      const res = await fetch('https://almsearch.dev.azure.com/Sittax/_apis/search/codesearchresults?api-version=7.1-preview.1', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${t}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ searchText: nome, $top: 25 }),
-      });
-      if (!res.ok) continue;
-      const d = await res.json();
-      const achou = (d.results || []).some((r) => {
-        const p = r.path || '';
-        return TEST_PATH.test(p) && p.toLowerCase().includes(nome.toLowerCase());
-      });
-      if (achou) { log(`  (teste no repo encontrado p/ ${nome})`); return true; }
-    } catch { /* ignora e segue */ }
-  }
-  return false;
-}
-const classeDoArquivo = (p) => (p.split('/').pop() || '').replace(/\.cs$/i, '');
 
 async function fileAtBranch(base, filePath, version, versionType = 'branch') {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(version)}&versionDescriptor.versionType=${versionType}&api-version=7.1&$format=text`, { asText: true });
@@ -406,7 +378,7 @@ async function postComment(wiId, html) {
 
 // reprovacao por falta de teste: zero tokens de IA — deteccao por codigo + comentario + estado Rejected
 // motivo: 'ausencia' (PR sem teste) ou 'cobertura' (tem teste, mas nao cobre a mudanca)
-async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = [] } = {}) {
+async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = [], info = null } = {}) {
   // nao duplica comentario quando o dev devolve pra Review sem corrigir
   const prev = await ado(`${ORG}/${proj}/_apis/wit/workItems/${wi.id}/comments?api-version=7.1-preview.3`);
   const jaReprovada = (prev.comments || []).some((c) => (c.text || '').includes('REPROVADO —'));
@@ -416,7 +388,6 @@ async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = 
     return;
   }
   const prLinks = prs.map((p) => `<a href="${p.url}">#${p.prId}</a>`).join(', ');
-  // lista os arquivos que exigem cobertura (cap 6) — torna o comentario acionavel
   const listaArquivos = () => {
     if (!arquivos.length) return '';
     const top = arquivos.slice(0, 6).map((p) => `<li><code>${esc(p)}</code></li>`).join('');
@@ -426,16 +397,20 @@ async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = 
   const H = [];
   if (motivo === 'cobertura') {
     H.push('<p><b>❌ REPROVADO — o teste não cobre a mudança</b></p>');
-    H.push(`<p>O(s) PR(s) ${prLinks} incluem teste, mas ele <b>não exercita a correção</b>${qt?.severidade ? ` (severidade <b>${esc(qt.severidade)}</b>)` : ''}.</p>`);
+    if (info?.resumo) H.push(`<p><b>O que mudou:</b> ${esc(info.resumo)}</p>`);
+    H.push(`<p>O(s) PR(s) ${prLinks} incluem teste, mas ele <b>não exercita a alteração</b>${qt?.severidade ? ` (severidade <b>${esc(qt.severidade)}</b>)` : ''}.</p>`);
     if (qt?.analise) H.push(`<p><b>O que ficou descoberto:</b> ${esc(qt.analise)}</p>`);
-    H.push('<p>➡️ Ajuste o teste para exercitar de fato o comportamento corrigido e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
+    if (info?.sugestao) H.push(`<p><b>O que cobrir:</b> ${esc(info.sugestao)}</p>`);
+    H.push('<p>➡️ Ajuste o teste para exercitar de fato a alteração e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
   } else {
     H.push('<p><b>❌ REPROVADO — falta de teste automatizado</b></p>');
-    H.push(`<p>O(s) PR(s) ${prLinks} alteram código que exige cobertura, mas <b>não incluem nenhum teste</b> (<code>/src/Tests/</code>, <code>*Test.cs</code>, <code>.spec.ts</code>).</p>`);
+    if (info?.resumo) H.push(`<p><b>O que mudou:</b> ${esc(info.resumo)}</p>`);
+    H.push(`<p>A atividade <b>altera comportamento</b> e exige cobertura, mas o(s) PR(s) ${prLinks} <b>não incluem teste</b> que exercite a alteração.${info?.justificativa ? ` ${esc(info.justificativa)}` : ''}</p>`);
     H.push(listaArquivos());
-    H.push('<p>➡️ Inclua teste automatizado cobrindo o comportamento alterado e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
+    if (info?.sugestao) H.push(`<p><b>O que cobrir:</b> ${esc(info.sugestao)}</p>`);
+    H.push('<p>➡️ Inclua teste automatizado cobrindo a alteração e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
   }
-  H.push('<p><i>Isento de teste: mudança só em frontend (<code>Sittax.Spa</code>) ou em integração com sistema externo (consumer de fila, cliente HTTP, API de terceiro).</i></p>');
+  H.push('<p><i>Não vale para: refatoração sem mudança de comportamento (testes existentes seguem válidos), frontend (<code>Sittax.Spa</code>), ou integração com sistema externo.</i></p>');
   H.push('<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>');
   await postComment(wi.id, H.join(''));
   await moveToRejected(wi);
@@ -576,25 +551,21 @@ for (const id of targets) {
     const precisaTeste = rep.teste_automatizado?.necessario === true; // refatoracao/coberto/dispensavel -> false
     if (isentoExterno) log('  ℹ️ mudanca classificada como integracao externa (sem logica testavel) — isenta de reprovacao por teste');
 
-    // AUSENCIA (PR sem teste): so reprova se (a) o Claude confirma que PRECISA de teste novo
-    // E (b) NAO existe teste no repo p/ a classe alterada (o dev pode provar que ja existe).
+    const info = { resumo: rep.resumo_da_mudanca, justificativa: rep.teste_automatizado?.justificativa, sugestao: rep.teste_automatizado?.sugestao };
+    // AUSENCIA (PR sem teste): reprova se o Claude confirma que ALTERA COMPORTAMENTO e precisa de
+    // teste. Refatoracao sem mudanca de comportamento -> necessario=false -> NAO reprova.
     if (autoRejAtivo && pendenteAusencia && !isentoExterno) {
       if (!precisaTeste) {
-        log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao / coberto / dispensavel) — roteiro normal, sem reprovar');
+        log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao sem mudanca de comportamento / dispensavel) — roteiro normal, sem reprovar');
+      } else if (!flags.comment) {
+        log('  DRY-RUN (--no-comment): seria reprovada (altera comportamento e nao ha teste que exercite), nada postado/movido.');
+        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
+        continue;
       } else {
-        const cobertoNoRepo = await repoTemTesteParaClasses(arquivosExigem.map(classeDoArquivo));
-        if (cobertoNoRepo) {
-          log('  ✅ sem teste no PR, mas EXISTE teste no repo p/ a(s) classe(s) alterada(s) — area coberta, sem reprovar');
-        } else if (!flags.comment) {
-          log('  DRY-RUN (--no-comment): seria reprovada (sem teste no PR e sem teste no repo p/ a classe), nada postado/movido.');
-          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
-          continue;
-        } else {
-          await autoReject(wi, prs, { motivo: 'ausencia', arquivos: arquivosExigem });
-          log('  ❌ sem teste no PR nem no repo p/ a classe — reprovada e movida para Rejected');
-          summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
-          continue;
-        }
+        await autoReject(wi, prs, { motivo: 'ausencia', arquivos: arquivosExigem, info });
+        log('  ❌ altera comportamento sem teste que exercite — reprovada e movida para Rejected');
+        summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', ok: true });
+        continue;
       }
     }
 
@@ -610,7 +581,7 @@ for (const id of targets) {
           summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
           continue;
         }
-        await autoReject(wi, prs, { motivo: 'cobertura', qt: qtv });
+        await autoReject(wi, prs, { motivo: 'cobertura', qt: qtv, info });
         log('  ❌ teste nao cobre a mudanca (severidade ALTA) — reprovada e movida para Rejected');
         summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', ok: true });
         continue;
