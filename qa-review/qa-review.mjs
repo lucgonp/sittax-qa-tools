@@ -148,6 +148,18 @@ const naoExigeTeste = (p) => isNoTestNeeded(p) || isExternal(p) || GENERATED.tes
 const NO_TEST_REPOS = ['sittax.ui.test'];
 const isNoTestRepo = (repoName) => NO_TEST_REPOS.includes(String(repoName || '').toLowerCase());
 
+// OVERRIDE DO DEV: o dev tem a palavra final sobre viabilidade de teste. Se marcar a tag
+// ou comentar a frase, o gate NAO reprova aquela atividade (mesmo com alteracao de comportamento).
+const OVERRIDE_TAGS = ['sem-teste-justificado', 'sem-teste-aprovado', 'sem-teste-viavel'];
+const OVERRIDE_FRASE = /sem[ -]teste[ -](justificad|aprovad|vi[aá]vel|necess[aá]ri)|n[aã]o h[aá] (como )?(escrever )?teste vi[aá]vel|teste n[aã]o (e|é) vi[aá]vel/i;
+async function devLiberouSemTeste(wi) {
+  if (OVERRIDE_TAGS.some((t) => (wi.tags || '').toLowerCase().includes(t))) return true;
+  try {
+    const r = await ado(`${ORG}/${proj}/_apis/wit/workItems/${wi.id}/comments?api-version=7.1-preview.3`);
+    return (r.comments || []).some((c) => OVERRIDE_FRASE.test((c.text || '').replace(/<[^>]+>/g, ' ')));
+  } catch { return false; }
+}
+
 
 async function fileAtBranch(base, filePath, version, versionType = 'branch') {
   return ado(`${base}/items?path=${encodeURIComponent(filePath)}&versionDescriptor.version=${encodeURIComponent(version)}&versionDescriptor.versionType=${versionType}&api-version=7.1&$format=text`, { asText: true });
@@ -411,6 +423,7 @@ async function autoReject(wi, prs, { motivo = 'ausencia', qt = null, arquivos = 
     H.push('<p>➡️ Inclua teste automatizado cobrindo a alteração e devolva a atividade para <b>Review</b> — a validação roda de novo automaticamente.</p>');
   }
   H.push('<p><i>Não vale para: refatoração sem mudança de comportamento (testes existentes seguem válidos), frontend (<code>Sittax.Spa</code>), ou integração com sistema externo.</i></p>');
+  H.push('<p><i>🟢 <b>Sem teste viável?</b> Se a mudança realmente não comporta teste (integração, infra, concorrência), adicione a tag <code>sem-teste-justificado</code> ao card (ou comente “sem teste viável”) e devolva para Review — o gate não reprova mais. A palavra final sobre viabilidade é do dev.</i></p>');
   H.push('<p><i>⚔️ You shall not pass! Código retido até a inclusão dos testes. — The White Sentinel</i></p>');
   await postComment(wi.id, H.join(''));
   await moveToRejected(wi);
@@ -557,6 +570,8 @@ for (const id of targets) {
     if (autoRejAtivo && pendenteAusencia && !isentoExterno) {
       if (!precisaTeste) {
         log('  ✅ sem teste no PR, mas o Claude avalia que NAO precisa de teste novo (refatoracao sem mudanca de comportamento / dispensavel) — roteiro normal, sem reprovar');
+      } else if (await devLiberouSemTeste(wi)) {
+        log('  ✅ dev liberou sem teste (tag/comentario de override) — nao reprova');
       } else if (!flags.comment) {
         log('  DRY-RUN (--no-comment): seria reprovada (altera comportamento e nao ha teste que exercite), nada postado/movido.');
         summary.push({ id, title: wi.title, rejeitada: true, motivo: 'ausencia', dryRun: true, ok: true });
@@ -575,7 +590,7 @@ for (const id of targets) {
     const testeNaoCobre = qtv?.cobre_criterio === false;
     const lacunaAlta = qtv?.severidade === 'alta';
     if (autoRejAtivo && exigeTesteReal && !pendenteAusencia && testeNaoCobre && !isentoExterno) {
-      if (lacunaAlta && precisaTeste) {
+      if (lacunaAlta && precisaTeste && !(await devLiberouSemTeste(wi))) {
         if (!flags.comment) {
           log('  DRY-RUN (--no-comment): seria reprovada (teste nao cobre — severidade alta), nada postado/movido.');
           summary.push({ id, title: wi.title, rejeitada: true, motivo: 'cobertura', dryRun: true, ok: true });
